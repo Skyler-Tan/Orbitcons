@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.9.2
+Cozy Orbit v0.9.0
 A customisable radial desktop control widget for KDE Plasma 6 (Wayland/X11).
 
 Requirements:
@@ -15,11 +15,6 @@ Run:
     python cozy_orbit.py
 
 User preferences are stored using QSettings.
-
-What's new in 0.9.2:
-    * Volume and brightness reveal an external curved slider on hover.
-    * Drag the slider knob along its arc to set the level directly.
-    * Fractional pixmap drawing reduces icon jitter during orbit rotation.
 
 What's new in 0.9.0:
     * System commands run in background threads, so the widget never freezes
@@ -60,11 +55,11 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMenu, QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QSlider, QCheckBox, QDialogButtonBox,
-    QFormLayout, QGroupBox, QMessageBox,
+    QFormLayout, QGroupBox, QMessageBox, QFrame, QPushButton,
 )
 
 APP_NAME = "Cozy Orbit"
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.1"
 ORG_NAME = "CozyOrbit"
 SETTINGS_DOMAIN = "cozy-orbit"
 
@@ -80,23 +75,17 @@ DRAG_THRESHOLD = 8
 # Radians per second for each speed level (level 2 ≈ one revolution / 2 min).
 ROTATION_RAD_PER_SEC_PER_LEVEL = 0.027
 
-LABELS = [
-    "Wi-Fi", "Bluetooth", "Volume Down", "Volume Up",
-    "Battery", "Brightness Down", "Brightness Up", "Settings",
-]
+LABELS = ["Wi-Fi", "Bluetooth", "Media", "Battery", "Settings"]
 # Prefer the active desktop icon theme (Breeze on KDE). Text fallbacks are
 # used only when a theme does not provide one of these standard icon names.
 SYSTEM_ICON_CANDIDATES = [
     ("network-wireless", "network-wireless-connected"),
     ("bluetooth", "bluetooth-active"),
-    ("audio-volume-low", "audio-volume-medium"),
-    ("audio-volume-high", "audio-volume-medium"),
+    ("audio-volume-high", "audio-volume-medium", "display-brightness"),
     ("battery", "battery-full"),
-    ("display-brightness-low", "display-brightness", "preferences-desktop-display"),
-    ("display-brightness-high", "display-brightness", "preferences-desktop-display"),
     ("preferences-system", "settings-configure"),
 ]
-ICON_FALLBACKS = ["W", "B", "−", "+", "%", "−", "+", "⚙"]
+ICON_FALLBACKS = ["W", "B", "◐", "%", "⚙"]
 
 THEMES = {
     "Pastel Pink": {
@@ -250,9 +239,33 @@ def read_volume() -> str:
 def read_brightness() -> str:
     out = get_output(["brightnessctl", "-m"])
     fields = out.split(",")
-    if len(fields) >= 5 and fields[4].endswith("%"):
-        return f"Brightness {fields[4]}"
+    if len(fields) >= 4 and fields[3].endswith("%"):
+        return f"Brightness {fields[3]}"
     return "Brightness changed"
+
+
+def read_volume_level() -> int:
+    if has_command("wpctl"):
+        out = get_output(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"] )
+        match = re.search(r"([\d.]+)", out)
+        if match:
+            return max(0, min(100, round(float(match.group(1)) * 100)))
+    if has_command("pactl"):
+        out = get_output(["pactl", "get-sink-volume", "@DEFAULT_SINK@"] )
+        match = re.search(r"(\d+)%", out)
+        if match:
+            return max(0, min(100, int(match.group(1))))
+    return 0
+
+
+def read_brightness_level() -> int:
+    out = get_output(["brightnessctl", "-m"])
+    fields = out.split(",")
+    if len(fields) >= 4:
+        match = re.search(r"(\d+)%", fields[3])
+        if match:
+            return max(0, min(100, int(match.group(1))))
+    return 0
 
 
 def autostart_file() -> Path:
@@ -418,6 +431,128 @@ class WidgetSettingsDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Custom media popover (kept beside Cozy Orbit; never opens a system OSD)
+# ---------------------------------------------------------------------------
+
+class MediaPopup(QFrame):
+    """A small, theme-matched volume/brightness slider anchored to the orbit."""
+
+    def __init__(self, orbit):
+        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint)
+        self.orbit = orbit
+        self.kind = "volume"
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
+        self.setObjectName("MediaPopup")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(9)
+        top = QHBoxLayout()
+        self.volume_button = QPushButton("Volume")
+        self.brightness_button = QPushButton("Brightness")
+        self.volume_button.clicked.connect(lambda: self.set_kind("volume"))
+        self.brightness_button.clicked.connect(lambda: self.set_kind("brightness"))
+        top.addWidget(self.volume_button)
+        top.addWidget(self.brightness_button)
+        root.addLayout(top)
+        value_row = QHBoxLayout()
+        self.title = QLabel("Volume")
+        self.percent = QLabel("0%")
+        self.percent.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        value_row.addWidget(self.title)
+        value_row.addStretch(1)
+        value_row.addWidget(self.percent)
+        root.addLayout(value_row)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, 100)
+        self.slider.valueChanged.connect(self.value_changed)
+        root.addWidget(self.slider)
+        self.setFixedWidth(250)
+        self.setStyleSheet("""
+            QFrame#MediaPopup { background: #FFF5FA; border: 1px solid #F7B8D0; border-radius: 13px; }
+            QLabel { color: #594563; font-size: 10pt; }
+            QPushButton { color: #594563; background: #F3E5F2; border: 0; border-radius: 8px; padding: 7px 10px; }
+            QPushButton:checked, QPushButton:hover { background: #E8D9F5; }
+            QSlider::groove:horizontal { height: 6px; background: #E4D4EA; border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: #C69BCF; border-radius: 3px; }
+            QSlider::handle:horizontal { width: 15px; margin: -5px 0; border-radius: 7px; background: #916A9E; }
+        """)
+        self.volume_button.setCheckable(True)
+        self.brightness_button.setCheckable(True)
+        self._updating = False
+        self._pending_value = None
+        self._write_timer = QTimer(self)
+        self._write_timer.setSingleShot(True)
+        self._write_timer.setInterval(85)
+        self._write_timer.timeout.connect(self._commit_value)
+        self._apply_theme()
+
+    def _apply_theme(self):
+        p = self.orbit.theme
+        self.setStyleSheet(f"""
+            QFrame#MediaPopup {{ background: {p['menu_bg']}; border: 1px solid {p['accent']}; border-radius: 13px; }}
+            QLabel {{ color: {p['menu_text']}; font-size: 10pt; }}
+            QPushButton {{ color: {p['menu_text']}; background: {p['menu_selected']}; border: 0; border-radius: 8px; padding: 7px 10px; }}
+            QPushButton:checked, QPushButton:hover {{ background: {p['accent']}; }}
+            QSlider::groove:horizontal {{ height: 6px; background: {p['menu_selected']}; border-radius: 3px; }}
+            QSlider::sub-page:horizontal {{ background: {p['accent']}; border-radius: 3px; }}
+            QSlider::handle:horizontal {{ width: 15px; margin: -5px 0; border-radius: 7px; background: {p['center_icon']}; }}
+        """)
+
+    def set_kind(self, kind):
+        self.kind = kind
+        self._updating = True
+        if kind == "volume":
+            value = read_volume_level()
+            self.title.setText("Volume")
+            self.volume_button.setChecked(True)
+            self.brightness_button.setChecked(False)
+        else:
+            value = read_brightness_level()
+            self.title.setText("Brightness")
+            self.volume_button.setChecked(False)
+            self.brightness_button.setChecked(True)
+        self.slider.setValue(value)
+        self.percent.setText(f"{value}%")
+        self._updating = False
+        self.orbit.volume_level = read_volume_level()
+        self.orbit.brightness_level = read_brightness_level()
+        self.orbit.update()
+
+    def value_changed(self, value):
+        self.percent.setText(f"{value}%")
+        if self._updating:
+            return
+        self._pending_value = value
+        self._write_timer.start()
+
+    def _commit_value(self):
+        if self._pending_value is not None:
+            value = self._pending_value
+            self._pending_value = None
+            self.orbit.set_media_level(self.kind, value)
+
+    def show_for_orbit(self, kind="volume"):
+        self._apply_theme()
+        self.set_kind(kind)
+        self.adjustSize()
+        orbit_rect = self.orbit.frameGeometry()
+        screen = QGuiApplication.screenAt(orbit_rect.center()) or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = orbit_rect.right() + 10
+        if x + self.width() > area.right():
+            x = orbit_rect.left() - self.width() - 10
+        y = orbit_rect.top() + (orbit_rect.height() - self.height()) // 2
+        y = max(area.top() + 8, min(y, area.bottom() - self.height() - 8))
+        x = max(area.left() + 8, min(x, area.right() - self.width() - 8))
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.slider.setFocus(Qt.FocusReason.OtherFocusReason)
+
+
+# ---------------------------------------------------------------------------
 # Main widget
 # ---------------------------------------------------------------------------
 
@@ -439,7 +574,7 @@ class CozyOrbit(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFixedSize(SIZE, SIZE)
-        self.setMouseTracking(True)
+        self.setMouseTracking(False)
         # Resolve icons from the desktop's active icon theme (normally KDE Breeze).
         self.system_icons = [desktop_icon(names) for names in SYSTEM_ICON_CANDIDATES]
 
@@ -457,12 +592,6 @@ class CozyOrbit(QWidget):
 
         self._progress = 0.0
         self.rotation = 0.0
-        self.hovered_index = -1
-        # Volume and brightness use an external curved slider, not a movable
-        # icon handle. The slider only appears while hovering those controls.
-        self.slider_kind = None
-        self.slider_value = 50
-        self.slider_dragging = False
         self.expanded = False
         self.rotation_paused = False
         self.pressed_index = -1
@@ -473,15 +602,14 @@ class CozyOrbit(QWidget):
         self.move_started = False
         self._last_frame = time.monotonic()
         self._status_busy = False
+        self.media_sector_open = False
+        self.volume_level = read_volume_level()
+        self.brightness_level = read_brightness_level()
+        self.media_popup = MediaPopup(self)
 
         self.rotation_resume_timer = QTimer(self)
         self.rotation_resume_timer.setSingleShot(True)
         self.rotation_resume_timer.timeout.connect(self.resume_rotation)
-
-        self.slider_apply_timer = QTimer(self)
-        self.slider_apply_timer.setSingleShot(True)
-        self.slider_apply_timer.setInterval(180)
-        self.slider_apply_timer.timeout.connect(self.apply_active_slider_value)
 
         self.position_timer = QTimer(self)
         self.position_timer.setSingleShot(True)
@@ -660,90 +788,14 @@ class CozyOrbit(QWidget):
 
     def get_positions(self):
         points = []
-        for i in range(8):
-            angle = -math.pi / 2 + i * (math.pi / 4) + self.rotation
+        for i in range(5):
+            angle = -math.pi / 2 + i * (2 * math.pi / 5) + self.rotation
             radius = ORBIT_RADIUS * self._progress
             points.append(QPointF(
                 CENTER.x() + math.cos(angle) * radius,
                 CENTER.y() + math.sin(angle) * radius,
             ))
         return points
-
-    def slider_anchor(self, kind=None):
-        """Anchor the curved slider to the hovered volume/brightness button."""
-        if kind is None:
-            kind = self.slider_kind
-        indices = {"volume": (2, 3), "brightness": (5, 6)}
-        if kind not in indices:
-            return None
-        # Use whichever of the paired buttons is currently hovered. This keeps
-        # the slider close to the pointer while preserving one shared level.
-        index = self.hovered_index if self.hovered_index in indices[kind] else indices[kind][0]
-        return self.get_positions()[index]
-
-    @staticmethod
-    def slider_point(anchor: QPointF, value: float, radius=43.0):
-        # A 270-degree C-shaped track, open toward the widget centre.
-        angle = math.radians(135.0 + 270.0 * max(0.0, min(100.0, value)) / 100.0)
-        return QPointF(anchor.x() + math.cos(angle) * radius,
-                       anchor.y() + math.sin(angle) * radius)
-
-    @staticmethod
-    def slider_value_at(anchor: QPointF, pos: QPointF):
-        angle = math.degrees(math.atan2(pos.y() - anchor.y(), pos.x() - anchor.x()))
-        if angle < 135.0:
-            angle += 360.0
-        return max(0, min(100, round((angle - 135.0) / 270.0 * 100.0)))
-
-    def slider_hit(self, pos: QPointF, kind=None):
-        anchor = self.slider_anchor(kind)
-        if anchor is None:
-            return False
-        radius = self.distance(pos, anchor)
-        if not 32 <= radius <= 55:
-            return False
-        angle = math.degrees(math.atan2(pos.y() - anchor.y(), pos.x() - anchor.x()))
-        if angle < 135.0:
-            angle += 360.0
-        return 135.0 <= angle <= 405.0
-
-    def read_slider_value(self, kind):
-        if kind == "volume":
-            out = get_output(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
-            match = re.search(r"([\d.]+)", out)
-            if match:
-                return max(0, min(100, round(float(match.group(1)) * 100)))
-            out = get_output(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
-            match = re.search(r"(\d+)%", out)
-            if match:
-                return max(0, min(100, int(match.group(1))))
-        elif kind == "brightness":
-            out = get_output(["brightnessctl", "-m"])
-            fields = out.split(",")
-            if len(fields) >= 5:
-                match = re.search(r"(\d+)%", fields[4])
-                if match:
-                    return max(0, min(100, int(match.group(1))))
-        return 50
-
-    def apply_active_slider_value(self):
-        if self.slider_kind and self.slider_dragging:
-            self.apply_slider_value(self.slider_kind, self.slider_value)
-
-    def apply_slider_value(self, kind, value):
-        value = max(0, min(100, int(value)))
-        if kind == "volume":
-            if has_command("wpctl"):
-                self.execute(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{value}%"], read_volume)
-            elif has_command("pactl"):
-                self.execute(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"], read_volume)
-            else:
-                self.notify("Audio control unavailable")
-        elif kind == "brightness":
-            if has_command("brightnessctl"):
-                self.execute(["brightnessctl", "set", f"{value}%"], read_brightness)
-            else:
-                self.notify("Install brightnessctl")
 
     @staticmethod
     def distance(a: QPointF, b: QPointF) -> float:
@@ -759,7 +811,10 @@ class CozyOrbit(QWidget):
         self.draw_background(painter)
         if self._progress > 0.001:
             self.draw_flower(painter)
-            self.draw_controls(painter)
+            if self.media_sector_open:
+                self.draw_media_sector(painter)
+            else:
+                self.draw_controls(painter)
         self.draw_center(painter)
         self.draw_notification(painter)
         painter.end()
@@ -826,9 +881,7 @@ class CozyOrbit(QWidget):
             icon_rect = QRectF(pos.x() - ICON_SIZE / 2, pos.y() - ICON_SIZE / 2,
                                ICON_SIZE, ICON_SIZE)
             if not icon.isNull():
-                # Keep the target rectangle fractional. Converting it to QRect
-                # rounds the position every frame and makes rotating icons jitter.
-                painter.drawPixmap(icon_rect, icon, QRectF(icon.rect()))
+                painter.drawPixmap(icon_rect.toRect(), icon)
             else:
                 painter.setPen(QColor(p["text"]))
                 painter.setFont(QFont("DejaVu Sans", 14, QFont.Weight.Bold))
@@ -838,51 +891,55 @@ class CozyOrbit(QWidget):
                 )
 
             if self._progress > 0.90:
-                painter.setFont(QFont("DejaVu Sans", 7, QFont.Weight.DemiBold))
+                painter.setFont(QFont("DejaVu Sans", 6 if i == 2 else 7, QFont.Weight.DemiBold))
                 painter.setPen(QColor(p["text"]))
+                label_width = 126 if i == 2 else 84
                 painter.drawText(
-                    QRectF(pos.x() - 42, pos.y() + 31, 84, 18),
+                    QRectF(pos.x() - label_width / 2, pos.y() + 31, label_width, 18),
                     Qt.AlignmentFlag.AlignCenter, self.get_label(i),
                 )
             painter.restore()
 
-        # External curved slider: only volume and brightness have one. It is
-        # drawn outside the icon button, like a normal slider bent around it.
-        if self._progress > 0.90 and self.slider_kind:
-            anchor = self.slider_anchor()
-            if anchor is not None:
-                radius = 43.0
-                rect = QRectF(anchor.x() - radius, anchor.y() - radius,
-                              radius * 2, radius * 2)
-                painter.save()
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(QColor(p["outline"]).darker(108), 7.0,
-                                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                painter.drawArc(rect, -135 * 16, -270 * 16)
-                painter.setPen(QPen(QColor(p["accent"]), 5.0,
-                                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                painter.drawArc(rect, -135 * 16, -int(270 * self.slider_value / 100) * 16)
-                knob = self.slider_point(anchor, self.slider_value, radius)
-                painter.setPen(QPen(QColor(p["outline"]), 1.5))
-                painter.setBrush(QColor(p["accent"]))
-                painter.drawEllipse(knob, 6.5, 6.5)
-                painter.setPen(QColor(p["text"]))
-                painter.setFont(QFont("DejaVu Sans", 7, QFont.Weight.DemiBold))
-                caption = "VOLUME" if self.slider_kind == "volume" else "BRIGHTNESS"
-                painter.drawText(QRectF(anchor.x() - 34, anchor.y() - 8, 68, 16),
-                                 Qt.AlignmentFlag.AlignCenter, f"{caption} {self.slider_value}%")
-                painter.restore()
-
     def get_label(self, index):
-        compact = ["Wi-Fi", "Bluetooth", "Vol −", "Vol +", "Battery",
-                   "Bright −", "Bright +", "Settings"]
         if index == 0:
             return f"Wi-Fi {self.wifi}"
         if index == 1:
             return f"BT {self.bluetooth}"
-        if index == 4:
+        if index == 2:
+            return f"Vol {self.volume_level}% · Bright {self.brightness_level}%"
+        if index == 3:
             return self.battery + (" ⚡" if self.battery_state == "Charging" else "")
-        return compact[index]
+        return "Settings"
+
+    def draw_media_sector(self, painter):
+        """Two large selectable semicircle sectors fill the orbit's flower area."""
+        p = self.theme
+        radius = 163 * self._progress
+        rect = QRectF(CENTER.x() - radius, CENTER.y() - radius, radius * 2, radius * 2)
+        painter.save()
+        painter.setPen(QPen(QColor(p["outline"]), 1.8))
+        # Left half: Volume. Right half: Brightness.
+        painter.setBrush(QColor(p["petal_a"]))
+        painter.drawPie(rect, 90 * 16, 180 * 16)
+        painter.setBrush(QColor(p["petal_b"]))
+        painter.drawPie(rect, -90 * 16, 180 * 16)
+        painter.setPen(QPen(QColor(p["text"]), 1.2))
+        painter.drawLine(QPointF(CENTER.x(), CENTER.y() - radius),
+                         QPointF(CENTER.x(), CENTER.y() + radius))
+        painter.setFont(QFont("DejaVu Sans", 13, QFont.Weight.DemiBold))
+        painter.drawText(QRectF(CENTER.x() - radius + 12, CENTER.y() - 24, radius - 24, 34),
+                         Qt.AlignmentFlag.AlignCenter, "Volume")
+        painter.drawText(QRectF(CENTER.x() + 12, CENTER.y() - 24, radius - 24, 34),
+                         Qt.AlignmentFlag.AlignCenter, "Brightness")
+        painter.setFont(QFont("DejaVu Sans", 17, QFont.Weight.Bold))
+        painter.drawText(QRectF(CENTER.x() - radius + 12, CENTER.y() + 8, radius - 24, 32),
+                         Qt.AlignmentFlag.AlignCenter, f"{self.volume_level}%")
+        painter.drawText(QRectF(CENTER.x() + 12, CENTER.y() + 8, radius - 24, 32),
+                         Qt.AlignmentFlag.AlignCenter, f"{self.brightness_level}%")
+        painter.setFont(QFont("DejaVu Sans", 8))
+        painter.drawText(QRectF(CENTER.x() - 60, CENTER.y() + radius - 28, 120, 18),
+                         Qt.AlignmentFlag.AlignCenter, "Click a side · Esc to close")
+        painter.restore()
 
     def draw_center(self, painter):
         p = self.theme
@@ -944,8 +1001,14 @@ class CozyOrbit(QWidget):
         self.update()
 
     # ----- mouse / keyboard ------------------------------------------------
+    # No hover expansion or hover highlighting.
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.media_sector_open:
+            self.media_sector_open = False
+            self.update()
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Escape and self.expanded:
             self.expand(False)
             event.accept()
@@ -956,8 +1019,8 @@ class CozyOrbit(QWidget):
         if event.button() == Qt.MouseButton.RightButton:
             pos = QPointF(event.position())
             if self._progress > 0.90:
-                for index, point in enumerate(self.get_positions()[:4]):
-                    if self.distance(pos, point) <= BUTTON_RADIUS + 12:
+                for index, point in enumerate(self.get_positions()):
+                    if self.distance(pos, point) <= BUTTON_RADIUS + 12 and index < 3:
                         if index < 2:
                             self.open_device_settings("wifi" if index == 0 else "bluetooth")
                         else:
@@ -977,22 +1040,17 @@ class CozyOrbit(QWidget):
         self.move_started = False
         self.pressed_index = -1
 
+        if self.media_sector_open:
+            event.accept()
+            return
+
         if self.distance(pos, CENTER) <= ORB_RADIUS + 10:
+            # Do not start a compositor move on every centre click. Starting a
+            # move immediately can swallow the click/release on Wayland.
             event.accept()
             return
 
         if self._progress > 0.90:
-            # Start dragging the curved slider when its track is clicked.
-            if self.slider_kind and self.slider_hit(pos):
-                self.slider_dragging = True
-                self.rotation_paused = True
-                self.rotation_resume_timer.stop()
-                anchor = self.slider_anchor()
-                self.slider_value = self.slider_value_at(anchor, pos)
-                self.update()
-                event.accept()
-                return
-
             for i, point in enumerate(self.get_positions()):
                 if self.distance(pos, point) <= BUTTON_RADIUS + 12:
                     self.pressed_index = i
@@ -1005,36 +1063,8 @@ class CozyOrbit(QWidget):
         self.move(current - (self.press_global_position - self.press_window_position))
 
     def mouseMoveEvent(self, event):
-        pos = QPointF(event.position())
-
-        if self.slider_dragging:
-            anchor = self.slider_anchor()
-            if anchor is not None:
-                self.slider_value = self.slider_value_at(anchor, pos)
-                self.slider_apply_timer.start()
-                self.update()
-            event.accept()
-            return
-
         if self.press_global_position is None:
-            new_hover = -1
-            if self._progress > 0.90:
-                for i, point in enumerate(self.get_positions()):
-                    if self.distance(pos, point) <= BUTTON_RADIUS + 12:
-                        new_hover = i
-                        break
-                if new_hover == -1 and self.slider_kind and self.slider_hit(pos):
-                    new_hover = self.hovered_index
-            if new_hover != self.hovered_index:
-                self.hovered_index = new_hover
-                new_kind = "volume" if new_hover in (2, 3) else "brightness" if new_hover in (5, 6) else None
-                if new_kind != self.slider_kind:
-                    self.slider_kind = new_kind
-                    if new_kind:
-                        self.slider_value = self.read_slider_value(new_kind)
-                self.update()
             return
-
         if self.distance(self.press_position, CENTER) > ORB_RADIUS + 10:
             event.accept()
             return
@@ -1043,6 +1073,8 @@ class CozyOrbit(QWidget):
         dy = current.y() - self.press_global_position.y()
         if not self.dragging and math.hypot(dx, dy) >= DRAG_THRESHOLD:
             self.dragging = True
+            # Begin a native move only after the pointer has actually moved.
+            # This keeps an ordinary click reliable while preserving Wayland drag.
             handle = self.windowHandle()
             if handle is not None:
                 self.move_started = bool(handle.startSystemMove())
@@ -1054,14 +1086,18 @@ class CozyOrbit(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
-        if self.slider_dragging:
-            self.slider_dragging = False
-            self.slider_apply_timer.stop()
-            self.apply_slider_value(self.slider_kind, self.slider_value)
-            self.rotation_paused = False
-            self.rotation_resume_timer.start(500)
+        if self.media_sector_open and self.press_global_position is not None:
+            local = QPointF(event.position())
+            radius = 163 * self._progress
+            if self.distance(local, CENTER) <= radius and self.distance(local, CENTER) > 34:
+                if local.x() < CENTER.x():
+                    self.media_popup.show_for_orbit("volume")
+                else:
+                    self.media_popup.show_for_orbit("brightness")
+            self.media_sector_open = False
             self.press_global_position = None
             self.press_window_position = None
+            self.rotation_paused = False
             self.update()
             event.accept()
             return
@@ -1086,20 +1122,18 @@ class CozyOrbit(QWidget):
                 QPointF(event.position()), self.get_positions()[index]
             ) <= BUTTON_RADIUS + 14:
                 self.activate(index)
-                self.rotation_resume_timer.start(900)
+                # Hold the orbit still briefly so the selected control is easy
+                # to follow while Wi-Fi/Bluetooth or another action responds.
+                if index == 2:
+                    self.rotation_paused = True
+                else:
+                    self.rotation_resume_timer.start(900)
             else:
                 self.rotation_paused = False
             self.update()
         self.press_global_position = None
         self.press_window_position = None
         event.accept()
-
-    def leaveEvent(self, event):
-        if self.press_global_position is None and self.hovered_index != -1:
-            self.hovered_index = -1
-            self.slider_kind = None
-            self.update()
-        super().leaveEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         # Treat a double-click as two deliberate centre clicks, without a special action.
@@ -1166,7 +1200,8 @@ class CozyOrbit(QWidget):
         if result.permission_error:
             self.show_brightness_permission_help()
             return
-        self.notify(result.message)
+        if result.message:
+            self.notify(result.message)
         if result.ok:
             QTimer.singleShot(700, self.refresh_status)
 
@@ -1194,16 +1229,51 @@ class CozyOrbit(QWidget):
         actions = {
             0: self.toggle_wifi,
             1: self.toggle_bluetooth,
-            2: lambda: self.change_volume(-1),
-            3: lambda: self.change_volume(+1),
-            4: self.show_battery,
-            5: lambda: self.change_brightness(-1),
-            6: lambda: self.change_brightness(+1),
-            7: self.open_widget_settings,
+            2: self.open_media_sector,
+            3: self.show_battery,
+            4: self.open_widget_settings,
         }
         action = actions.get(index)
         if action:
             action()
+
+    def open_media_sector(self):
+        self.volume_level = read_volume_level()
+        self.brightness_level = read_brightness_level()
+        self.media_sector_open = True
+        self.rotation_paused = True
+        self.update()
+
+    def set_media_level(self, kind: str, value: int):
+        value = max(0, min(100, int(value)))
+        if kind == "volume":
+            self.volume_level = value
+            if has_command("wpctl"):
+                command = ["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", f"{value / 100:.2f}"]
+            elif has_command("pactl"):
+                command = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"]
+            else:
+                self.notify("Audio control unavailable")
+                return
+        else:
+            self.brightness_level = value
+            if not has_command("brightnessctl"):
+                self.notify("Install brightnessctl")
+                return
+            command = ["brightnessctl", "set", f"{value}%"]
+        # Run each adjustment off the UI thread; the popup remains responsive.
+        self.run_job(lambda: self._run_media_command(command, kind, value))
+        self.update()
+
+    def _run_media_command(self, command, kind, value):
+        result = run_command(command)
+        if result is None or result.returncode != 0:
+            error = (result.stderr.strip() if result else "Command timed out") or "Operation failed"
+            permission = kind == "brightness" and any(
+                term in error.lower() for term in ("permission denied", "operation not permitted", "access denied")
+            )
+            return JobResult(False, error.splitlines()[-1], permission)
+        return JobResult(True, "")
 
     def toggle_wifi(self):
         if self.wifi not in ("On", "Off"):
@@ -1358,6 +1428,7 @@ class CozyOrbit(QWidget):
         self.frame_timer.stop()
         self.status_timer.stop()
         self.notification_timer.stop()
+        self.media_popup.close()
         self.animation.stop()
         event.accept()
 
