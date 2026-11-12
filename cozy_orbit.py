@@ -330,7 +330,7 @@ class CozyOrbit(QWidget):
 
     def animation_frame(self):
         if self.expanded and self.rotation_enabled and not self.rotation_paused:
-            self.rotation = (self.rotation + self.rotation_speed) % (2 * math.pi)
+            self.rotation = (self.rotation + self.rotation_speed) % (3 * math.pi)
             self.update()
 
     def get_positions(self):

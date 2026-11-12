@@ -1,37 +1,165 @@
-# Cozy Orbit v0.3.1
+# Cozy Orbit
 
-Patched floating radial control widget for Kubuntu/KDE Plasma. The rendering path keeps one fixed-size, translucent QWidget for the lifetime of the process and never calls `setMask()` or `clearMask()`. The orbit animates through painting only; the widget is not resized during hover transitions.
+**Cozy Orbit** is a lightweight floating desktop control widget for Linux, built with Python and PySide6. It places a compact radial control interface on the desktop for quick access to common system functions.
 
-## Install or update
+> **Project status:** v0.6.0 — early release. Developed and tested primarily on Kubuntu with KDE Plasma 6. Behaviour may differ on other desktop environments and Wayland compositors.
 
-Extract this directory, open a terminal in it, then run:
+## Features
+
+- Floating, frameless desktop interface.
+- Expand and collapse from the centre control.
+- Drag the centre to reposition the widget.
+- Radial controls for Wi-Fi, Bluetooth, volume, battery, brightness and widget settings.
+- Built-in widget settings, including available colour themes and rotation preferences.
+- Right-click context menu.
+- Preferences stored using Qt `QSettings`.
+- Diagnostic script and application log to help troubleshoot issues.
+
+The availability of individual system controls depends on your Linux distribution, desktop session, hardware and installed command-line utilities.
+
+## Important: what Cozy Orbit is
+
+Cozy Orbit is currently a **standalone desktop overlay application**. It is not yet a native KDE Plasma Plasmoid and does not appear as an applet embedded in the Plasma panel or desktop-widget management system.
+
+## Supported environment
+
+The initial target environment is:
+
+- Kubuntu / Ubuntu-based Linux
+- KDE Plasma 6
+- Python 3
+- PySide6
+- Wayland or X11 (window movement and behaviour can vary by compositor)
+
+Other Linux distributions and desktop environments may work, but have not been verified.
+
+## Requirements
+
+- Python 3
+- Python virtual-environment support (`venv`)
+- `pip`
+- PySide6 (installed in the application's virtual environment by the installer)
+
+Optional system utilities used by system controls:
+
+| Utility | Purpose |
+|---|---|
+| `nmcli` | Wi-Fi status and control |
+| `bluetoothctl` | Bluetooth status and control |
+| `wpctl` | PipeWire volume control |
+| `pactl` | PulseAudio-compatible volume fallback |
+| `brightnessctl` | Screen brightness control |
+| `systemsettings` | Opens KDE System Settings |
+
+Some controls may require additional permissions or hardware support. Missing optional utilities do not necessarily prevent the widget from starting.
+
+## Installation
+
+Clone or download this repository, then open a terminal in the project directory.
 
 ```bash
-chmod +x install.sh
+chmod +x install.sh launch.sh diagnose.sh uninstall.sh
 ./install.sh
 ```
 
-The installer updates `~/.local/opt/cozy-orbit/cozy_orbit.py`, preserves the existing virtual environment, and saves a timestamped copy of the old Python file before replacing it. It installs/updates PySide6 in that environment, adds an application-menu entry, and enables autostart. To launch manually, run `~/.local/opt/cozy-orbit/launch.sh`.
+The installer places the application under:
 
-## Controls
+```text
+~/.local/opt/cozy-orbit/
+```
 
-- Hover over the flower orb to expand the radial menu; move away to collapse it.
-- Drag the center orb to reposition it. The position is saved.
-- Click Wi-Fi or Bluetooth to toggle; volume and brightness buttons adjust by 5%; battery shows the current percentage; Settings opens KDE System Settings.
-- Right-click the widget for Quit.
+It creates a Python virtual environment, installs PySide6 if it is not already available in that environment, and creates a KDE application-menu entry and an autostart entry.
 
-System commands are optional and use `nmcli`, `bluetoothctl`, `pactl`, and `brightnessctl`; missing commands do not crash the app. Install dependencies as needed with `sudo apt install network-manager bluez pulseaudio-utils brightnessctl`. Battery reads `/sys/class/power_supply`.
+**Internet access may be required** the first time PySide6 is installed. Existing virtual-environment dependencies are reused when available.
 
-## If it still fails
+## Launching
 
-Run `~/.local/opt/cozy-orbit/diagnose.sh`. It prints session/runtime details and the recent app log. The launcher logs to `~/.local/state/cozy-orbit/last-run.log`. For Qt platform diagnostics:
+After installation, launch Cozy Orbit from your application menu, or run:
+
+```bash
+~/.local/opt/cozy-orbit/launch.sh
+```
+
+Application output is recorded at:
+
+```text
+~/.local/state/cozy-orbit/last-run.log
+```
+
+If `XDG_STATE_HOME` is set, the log is stored under that directory instead.
+
+## Diagnostics
+
+From the repository directory, run:
+
+```bash
+./diagnose.sh
+```
+
+The diagnostic script reports the session type, Qt platform override, Python and PySide6 versions, availability of optional system commands, and the last 80 lines of the application log.
+
+For additional Qt platform logging, try:
 
 ```bash
 QT_LOGGING_RULES='qt.qpa.*=true' ~/.local/opt/cozy-orbit/launch.sh
 ```
 
-As a diagnostic fallback, try `QT_QPA_PLATFORM=xcb ~/.local/opt/cozy-orbit/launch.sh` when XWayland is installed/available. This selects Qt's XCB platform plugin; it is not required for normal operation.
+If you are using Wayland and XWayland is available, you can test the X11 Qt backend with:
 
-## Crash fix notes
+```bash
+QT_QPA_PLATFORM=xcb ~/.local/opt/cozy-orbit/launch.sh
+```
 
-The reported stack ends in QtWayland's shared-memory backing-store flush path. Dynamic window masks are removed, as are animation-time geometry changes. The app uses ordinary QWidget painting with a fixed client area and disables the extra system-background clear pass. This avoids the prior trigger pattern, though the exact Qt/compositor/driver combination still needs confirmation on the affected Kubuntu machine.
+This is a troubleshooting option, not a guaranteed fix.
+
+## Updating
+
+Download or pull the latest repository version and rerun:
+
+```bash
+./install.sh
+```
+
+The installer backs up the existing `cozy_orbit.py` before replacing it. It also reuses the existing virtual environment when possible.
+
+Keep a copy of your project directory and any local changes before updating.
+
+## Uninstallation
+
+Run the uninstaller from the project directory:
+
+```bash
+./uninstall.sh
+```
+
+The uninstaller asks for confirmation, removes the installed application and its application-menu/autostart entries, and **preserves user settings and diagnostic logs**.
+
+## Configuration and privacy
+
+Cozy Orbit stores widget preferences locally through Qt `QSettings`. It does not need an online account to run. Diagnostic output is stored locally in the user's state directory.
+
+The exact QSettings file location depends on the organisation and application identifiers configured in the source code and the platform.
+
+## Known limitations
+
+- Wayland compositors control window movement and placement. Dragging and positioning can behave differently between desktop environments.
+- Brightness control depends on supported hardware and system permissions.
+- Wi-Fi, Bluetooth and audio controls depend on the corresponding system services and utilities.
+- This release is a standalone PySide6 overlay, not a native Plasma widget.
+- The project has been developed primarily for Kubuntu / KDE Plasma 6; broader compatibility still needs testing.
+
+## Contributing
+
+Bug reports, testing feedback and pull requests are welcome. When reporting an issue, please include:
+
+1. Linux distribution and version.
+2. Desktop environment and version.
+3. Session type (`Wayland` or `X11`).
+4. Output from `./diagnose.sh`.
+5. Relevant lines from `~/.local/state/cozy-orbit/last-run.log`.
+
+Please remove personal information from logs before sharing them publicly.
+
+## License
+
+Cozy Orbit is distributed under the MIT License. See [LICENSE](LICENSE).

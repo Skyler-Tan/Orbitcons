@@ -1,0 +1,2 @@
+# Cozy Orbit runtime dependencies
+PySide6
