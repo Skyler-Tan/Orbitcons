@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.9.0
+Cozy Orbit v0.9.1
 A customisable radial desktop control widget for KDE Plasma 6 (Wayland/X11).
 
 Requirements:
@@ -15,6 +15,11 @@ Run:
     python cozy_orbit.py
 
 User preferences are stored using QSettings.
+
+What's new in 0.9.1:
+    * Individual controls can be repositioned using their hover-arc handles.
+    * Fractional pixmap drawing reduces icon jitter during orbit rotation.
+    * Subtle hover feedback keeps the controls compact.
 
 What's new in 0.9.0:
     * System commands run in background threads, so the widget never freezes
@@ -59,7 +64,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Cozy Orbit"
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 ORG_NAME = "CozyOrbit"
 SETTINGS_DOMAIN = "cozy-orbit"
 
@@ -434,7 +439,7 @@ class CozyOrbit(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFixedSize(SIZE, SIZE)
-        self.setMouseTracking(False)
+        self.setMouseTracking(True)
         # Resolve icons from the desktop's active icon theme (normally KDE Breeze).
         self.system_icons = [desktop_icon(names) for names in SYSTEM_ICON_CANDIDATES]
 
@@ -452,6 +457,16 @@ class CozyOrbit(QWidget):
 
         self._progress = 0.0
         self.rotation = 0.0
+        saved_offsets = self.settings.value("control_offsets", [])
+        try:
+            self.control_offsets = [
+                float(saved_offsets[i]) if i < len(saved_offsets) else 0.0
+                for i in range(8)
+            ]
+        except (TypeError, ValueError, IndexError):
+            self.control_offsets = [0.0] * 8
+        self.hovered_index = -1
+        self.dragging_control = False
         self.expanded = False
         self.rotation_paused = False
         self.pressed_index = -1
@@ -645,13 +660,29 @@ class CozyOrbit(QWidget):
     def get_positions(self):
         points = []
         for i in range(8):
-            angle = -math.pi / 2 + i * (math.pi / 4) + self.rotation
+            angle = (
+                -math.pi / 2 + i * (math.pi / 4)
+                + self.rotation + self.control_offsets[i]
+            )
             radius = ORBIT_RADIUS * self._progress
             points.append(QPointF(
                 CENTER.x() + math.cos(angle) * radius,
                 CENTER.y() + math.sin(angle) * radius,
             ))
         return points
+
+    def get_handle_positions(self):
+        """Small drag handles sit just outside each control's hover arc."""
+        handles = []
+        for point in self.get_positions():
+            dx, dy = point.x() - CENTER.x(), point.y() - CENTER.y()
+            length = max(1.0, math.hypot(dx, dy))
+            offset = BUTTON_RADIUS + 11
+            handles.append(QPointF(
+                point.x() + dx / length * offset,
+                point.y() + dy / length * offset,
+            ))
+        return handles
 
     @staticmethod
     def distance(a: QPointF, b: QPointF) -> float:
@@ -734,7 +765,9 @@ class CozyOrbit(QWidget):
             icon_rect = QRectF(pos.x() - ICON_SIZE / 2, pos.y() - ICON_SIZE / 2,
                                ICON_SIZE, ICON_SIZE)
             if not icon.isNull():
-                painter.drawPixmap(icon_rect.toRect(), icon)
+                # Keep the target rectangle fractional. Converting it to QRect
+                # rounds the position every frame and makes rotating icons jitter.
+                painter.drawPixmap(icon_rect, icon, QRectF(icon.rect()))
             else:
                 painter.setPen(QColor(p["text"]))
                 painter.setFont(QFont("DejaVu Sans", 14, QFont.Weight.Bold))
@@ -742,6 +775,28 @@ class CozyOrbit(QWidget):
                     QRectF(pos.x() - 17, pos.y() - 17, 34, 34),
                     Qt.AlignmentFlag.AlignCenter, ICON_FALLBACKS[i],
                 )
+
+            if self._progress > 0.90 and i == self.hovered_index:
+                # A light, separate arc with a tiny grab point; the control
+                # itself never grows or pops out of the orbit.
+                arc_rect = QRectF(
+                    pos.x() - BUTTON_RADIUS - 8,
+                    pos.y() - BUTTON_RADIUS - 8,
+                    (BUTTON_RADIUS + 8) * 2,
+                    (BUTTON_RADIUS + 8) * 2,
+                )
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(p["accent"]), 2.4,
+                                    Qt.PenStyle.SolidLine,
+                                    Qt.PenCapStyle.RoundCap))
+                painter.drawArc(arc_rect, 25 * 16, 290 * 16)
+                handle = self.get_handle_positions()[i]
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(p["accent"]))
+                painter.drawEllipse(handle, 4.2, 4.2)
+                painter.setPen(QPen(QColor(p["outline"]), 1.0))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(handle, 4.2, 4.2)
 
             if self._progress > 0.90:
                 painter.setFont(QFont("DejaVu Sans", 7, QFont.Weight.DemiBold))
@@ -855,15 +910,25 @@ class CozyOrbit(QWidget):
         self.press_window_position = self.pos()
         self.dragging = False
         self.move_started = False
+        self.dragging_control = False
         self.pressed_index = -1
 
         if self.distance(pos, CENTER) <= ORB_RADIUS + 10:
-            # Do not start a compositor move on every centre click. Starting a
-            # move immediately can swallow the click/release on Wayland.
             event.accept()
             return
 
         if self._progress > 0.90:
+            # The small outer handle is the drag target. Dragging it moves only
+            # that control around the orbit, not the whole widget or control set.
+            for i, handle in enumerate(self.get_handle_positions()):
+                if self.distance(pos, handle) <= 10:
+                    self.pressed_index = i
+                    self.dragging_control = True
+                    self.rotation_paused = True
+                    self.rotation_resume_timer.stop()
+                    event.accept()
+                    return
+
             for i, point in enumerate(self.get_positions()):
                 if self.distance(pos, point) <= BUTTON_RADIUS + 12:
                     self.pressed_index = i
@@ -876,8 +941,36 @@ class CozyOrbit(QWidget):
         self.move(current - (self.press_global_position - self.press_window_position))
 
     def mouseMoveEvent(self, event):
+        pos = QPointF(event.position())
+
         if self.press_global_position is None:
+            new_hover = -1
+            if self._progress > 0.90:
+                for i, point in enumerate(self.get_positions()):
+                    if self.distance(pos, point) <= BUTTON_RADIUS + 12:
+                        new_hover = i
+                        break
+                    if self.distance(pos, self.get_handle_positions()[i]) <= 10:
+                        new_hover = i
+                        break
+            if new_hover != self.hovered_index:
+                self.hovered_index = new_hover
+                self.update()
             return
+
+        if self.dragging_control and self.pressed_index >= 0:
+            dx = pos.x() - CENTER.x()
+            dy = pos.y() - CENTER.y()
+            angle = math.atan2(dy, dx)
+            base = -math.pi / 2 + self.pressed_index * (math.pi / 4)
+            offset = angle - base - self.rotation
+            self.control_offsets[self.pressed_index] = (
+                offset + math.pi
+            ) % (2 * math.pi) - math.pi
+            self.update()
+            event.accept()
+            return
+
         if self.distance(self.press_position, CENTER) > ORB_RADIUS + 10:
             event.accept()
             return
@@ -886,8 +979,6 @@ class CozyOrbit(QWidget):
         dy = current.y() - self.press_global_position.y()
         if not self.dragging and math.hypot(dx, dy) >= DRAG_THRESHOLD:
             self.dragging = True
-            # Begin a native move only after the pointer has actually moved.
-            # This keeps an ordinary click reliable while preserving Wayland drag.
             handle = self.windowHandle()
             if handle is not None:
                 self.move_started = bool(handle.startSystemMove())
@@ -897,6 +988,18 @@ class CozyOrbit(QWidget):
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        if self.dragging_control:
+            self.settings.setValue("control_offsets", self.control_offsets)
+            self.dragging_control = False
+            self.pressed_index = -1
+            self.rotation_paused = False
+            self.rotation_resume_timer.start(500)
+            self.press_global_position = None
+            self.press_window_position = None
+            self.update()
+            event.accept()
             return
 
         if self.press_global_position is not None:
@@ -919,8 +1022,6 @@ class CozyOrbit(QWidget):
                 QPointF(event.position()), self.get_positions()[index]
             ) <= BUTTON_RADIUS + 14:
                 self.activate(index)
-                # Hold the orbit still briefly so the selected control is easy
-                # to follow while Wi-Fi/Bluetooth or another action responds.
                 self.rotation_resume_timer.start(900)
             else:
                 self.rotation_paused = False
@@ -928,6 +1029,12 @@ class CozyOrbit(QWidget):
         self.press_global_position = None
         self.press_window_position = None
         event.accept()
+
+    def leaveEvent(self, event):
+        if self.press_global_position is None and self.hovered_index != -1:
+            self.hovered_index = -1
+            self.update()
+        super().leaveEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         # Treat a double-click as two deliberate centre clicks, without a special action.
