@@ -1,1451 +1,769 @@
-
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.5.0
-Pastel radial desktop control for Kubuntu / KDE Plasma 6.
+Cozy Orbit v0.6.0
+A customisable radial desktop control widget for KDE Plasma 6 (Wayland/X11).
 
-Designed for:
-    Kubuntu
-    KDE Plasma 6
-    Wayland
+Requirements:
+    Python 3.10+
     PySide6
+    NetworkManager (nmcli) for Wi-Fi
+    BlueZ (bluetoothctl) for Bluetooth
+    PipeWire (wpctl) or PulseAudio (pactl) for volume
+    brightnessctl for brightness
 
-Interaction:
-    Hover centre       -> Expand
-    Move pointer       -> Select controls
-    Expanded           -> Slowly rotates clockwise
-    Click control      -> Activate
-    Drag centre        -> Move window through KDE compositor
-    Leave window       -> Collapse
-    Right-click        -> Context menu
+Run:
+    python cozy_orbit.py
+
+User preferences are stored using QSettings.
 """
 
+from __future__ import annotations
+
 import math
-import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 from PySide6.QtCore import (
-    Qt,
-    QPointF,
-    QRectF,
-    QTimer,
-    QEasingCurve,
-    QPropertyAnimation,
-    Property,
+    Qt, QPointF, QRectF, QTimer, QEasingCurve,
+    QPropertyAnimation, Property, QSettings,
 )
-
 from PySide6.QtGui import (
-    QAction,
-    QColor,
-    QFont,
-    QPainter,
-    QPen,
-    QBrush,
-    QLinearGradient,
+    QAction, QColor, QFont, QPainter, QPen, QBrush, QLinearGradient,
 )
-
 from PySide6.QtWidgets import (
-    QApplication,
-    QWidget,
-    QMenu,
+    QApplication, QWidget, QMenu, QDialog, QVBoxLayout, QHBoxLayout,
+    QLabel, QComboBox, QSlider, QCheckBox, QDialogButtonBox,
+    QFormLayout, QGroupBox, QPushButton,
 )
-
-
-# ==================================================
-# CONFIGURATION
-# ==================================================
 
 APP_NAME = "Cozy Orbit"
-VERSION = "0.5.0"
-
-APP_DIR = Path.home() / ".local/share/cozy-orbit"
-APP_DIR.mkdir(parents=True, exist_ok=True)
+APP_VERSION = "0.6.0"
+ORG_NAME = "CozyOrbit"
+SETTINGS_DOMAIN = "cozy-orbit"
 
 SIZE = 420
-
-CENTER = QPointF(210, 210)
-
+CENTER = QPointF(SIZE / 2, SIZE / 2)
 ORB_RADIUS = 34
 BUTTON_RADIUS = 26
 ORBIT_RADIUS = 137
-
-ROTATION_SPEED = 0.0025
-REFRESH_INTERVAL = 3000
-
-# Pastel colour palette
-
-PINK = QColor("#FFD3E3")
-PINK_DARK = QColor("#F7B8D0")
-
-LAVENDER = QColor("#DCCBFA")
-LAVENDER_DARK = QColor("#C4A9EB")
-
-PURPLE = QColor("#80658F")
-TEXT = QColor("#594563")
-
-WHITE = QColor("#FFFFFF")
-
-# Eight radial controls
+FRAME_INTERVAL_MS = 16
+STATUS_INTERVAL_MS = 3000
+DRAG_THRESHOLD = 8
 
 LABELS = [
-    "Wi-Fi",
-    "Bluetooth",
-    "Volume Down",
-    "Volume Up",
-    "Battery",
-    "Brightness Down",
-    "Brightness Up",
-    "Settings",
+    "Wi-Fi", "Bluetooth", "Volume Down", "Volume Up",
+    "Battery", "Brightness Down", "Brightness Up", "Settings",
 ]
+ICONS = ["W", "B", "−", "+", "%", "−", "+", "S"]
 
-# Use ordinary characters to avoid missing
-# Unicode icon fonts on Linux.
+THEMES = {
+    "Pastel Pink": {
+        "background_start": "#FFF1F9", "background_end": "#E2D5FA",
+        "petal_a": "#FFD3E3", "petal_b": "#DCCBFA",
+        "button_a": "#FFD3E3", "button_b": "#DCCBFA",
+        "center_start": "#FFE5EE", "center_end": "#E4D4FA",
+        "accent": "#F7B8D0", "text": "#594563",
+        "center_icon": "#916A9E", "outline": "#FFFFFF",
+        "menu_bg": "#FFF5FA", "menu_text": "#594563",
+        "menu_selected": "#E8D9F5",
+    },
+    "Lavender": {
+        "background_start": "#F4EEFF", "background_end": "#DCD0F5",
+        "petal_a": "#DCCBFA", "petal_b": "#C4A9EB",
+        "button_a": "#DCCBFA", "button_b": "#C4A9EB",
+        "center_start": "#F0E8FF", "center_end": "#CDB9F0",
+        "accent": "#B99BE5", "text": "#514267",
+        "center_icon": "#765D9B", "outline": "#FFFFFF",
+        "menu_bg": "#F7F2FF", "menu_text": "#514267",
+        "menu_selected": "#E5D9F7",
+    },
+    "Ocean Blue": {
+        "background_start": "#EAF8FF", "background_end": "#C9E6F7",
+        "petal_a": "#BFE7F5", "petal_b": "#BFCFF4",
+        "button_a": "#BFE7F5", "button_b": "#BFCFF4",
+        "center_start": "#E0F7FF", "center_end": "#C9DDF7",
+        "accent": "#8ECDE5", "text": "#34566B",
+        "center_icon": "#477D9B", "outline": "#FFFFFF",
+        "menu_bg": "#F0FAFF", "menu_text": "#34566B",
+        "menu_selected": "#D7EFF9",
+    },
+    "Mint Green": {
+        "background_start": "#EEFFF7", "background_end": "#D0F0E2",
+        "petal_a": "#C7F0DF", "petal_b": "#CDE8F5",
+        "button_a": "#C7F0DF", "button_b": "#CDE8F5",
+        "center_start": "#E5FFF3", "center_end": "#CBEDE0",
+        "accent": "#9ADCC3", "text": "#3D6255",
+        "center_icon": "#568A75", "outline": "#FFFFFF",
+        "menu_bg": "#F2FFF9", "menu_text": "#3D6255",
+        "menu_selected": "#D8F4E7",
+    },
+    "Dark": {
+        "background_start": "#393347", "background_end": "#242333",
+        "petal_a": "#78658E", "petal_b": "#5B668B",
+        "button_a": "#78658E", "button_b": "#5B668B",
+        "center_start": "#665477", "center_end": "#3F526F",
+        "accent": "#B99BE5", "text": "#F4ECFA",
+        "center_icon": "#FFFFFF", "outline": "#CFC3E2",
+        "menu_bg": "#302B3B", "menu_text": "#F4ECFA",
+        "menu_selected": "#514663",
+    },
+}
 
-ICONS = [
-    "W",
-    "B",
-    "-",
-    "+",
-    "%",
-    "-",
-    "+",
-    "S",
-]
 
-
-# ==================================================
-# SYSTEM UTILITIES
-# ==================================================
-
-def has_command(name):
+def has_command(name: str) -> bool:
     return shutil.which(name) is not None
 
 
-def run_command(args, timeout=4):
-
+def run_command(args: list[str], timeout: float = 4.0):
     try:
         return subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
+            args, capture_output=True, text=True, timeout=timeout, check=False
         )
-
-    except (
-        OSError,
-        subprocess.TimeoutExpired,
-    ):
+    except (OSError, subprocess.TimeoutExpired):
         return None
 
 
-def get_output(args, fallback=""):
-
+def get_output(args: list[str], fallback: str = "") -> str:
     result = run_command(args)
-
     if result and result.returncode == 0:
         return result.stdout.strip()
-
     return fallback
 
 
-def launch_application(name):
-
+def launch_application(name: str) -> bool:
     executable = shutil.which(name)
-
     if not executable:
         return False
-
     try:
         subprocess.Popen(
-            [executable],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            [executable], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
         )
-
         return True
-
     except OSError:
         return False
 
 
-# ==================================================
-# MAIN WINDOW
-# ==================================================
+class WidgetSettingsDialog(QDialog):
+    """Preferences dialog for Cozy Orbit itself."""
+
+    def __init__(self, settings: QSettings, parent=None):
+        super().__init__(parent)
+        self.settings = settings
+        self.setWindowTitle("Cozy Orbit — Widget Settings")
+        self.setMinimumWidth(340)
+        self.setModal(True)
+
+        root = QVBoxLayout(self)
+        intro = QLabel("Personalise the look and motion of your orbit.")
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        appearance = QGroupBox("Appearance")
+        appearance_form = QFormLayout(appearance)
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(THEMES.keys())
+        self.theme_combo.setCurrentText(
+            settings.value("theme", "Pastel Pink", type=str)
+        )
+        appearance_form.addRow("Colour theme", self.theme_combo)
+        root.addWidget(appearance)
+
+        motion = QGroupBox("Animation")
+        motion_layout = QVBoxLayout(motion)
+        self.rotate_check = QCheckBox("Rotate controls while the menu is open")
+        self.rotate_check.setChecked(
+            settings.value("rotation_enabled", True, type=bool)
+        )
+        motion_layout.addWidget(self.rotate_check)
+
+        speed_row = QHBoxLayout()
+        speed_row.addWidget(QLabel("Rotation speed"))
+        self.speed_value = QLabel()
+        speed_row.addStretch(1)
+        speed_row.addWidget(self.speed_value)
+        motion_layout.addLayout(speed_row)
+
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(1, 10)
+        self.speed_slider.setValue(
+            settings.value("rotation_speed_level", 2, type=int)
+        )
+        self.speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.speed_slider.setTickInterval(1)
+        self.speed_slider.valueChanged.connect(self.update_speed_label)
+        motion_layout.addWidget(self.speed_slider)
+        self.update_speed_label(self.speed_slider.value())
+        root.addWidget(motion)
+
+        info = QLabel(
+            "Changes are saved on this device and applied immediately. "
+            "The widget's right-click menu also contains refresh and quit."
+        )
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+        self.setStyleSheet("""
+            QDialog { background: palette(window); }
+            QGroupBox {
+                font-weight: 600; border: 1px solid palette(mid);
+                border-radius: 8px; margin-top: 10px; padding: 10px;
+            }
+            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+            QPushButton { padding: 6px 14px; }
+        """)
+
+    def update_speed_label(self, value: int):
+        labels = {
+            1: "Very slow", 2: "Slow", 3: "Gentle", 4: "Relaxed",
+            5: "Normal", 6: "Lively", 7: "Fast", 8: "Very fast",
+            9: "Rapid", 10: "Maximum",
+        }
+        self.speed_value.setText(labels.get(value, "Slow"))
+
+    def save_preferences(self):
+        self.settings.setValue("theme", self.theme_combo.currentText())
+        self.settings.setValue("rotation_enabled", self.rotate_check.isChecked())
+        self.settings.setValue("rotation_speed_level", self.speed_slider.value())
+        self.settings.sync()
+
 
 class CozyOrbit(QWidget):
-
     def __init__(self):
-
         super().__init__()
-
+        self.settings = QSettings(ORG_NAME, SETTINGS_DOMAIN)
         self.setWindowTitle(APP_NAME)
-
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
-
-        self.setAttribute(
-            Qt.WidgetAttribute.WA_TranslucentBackground,
-            True,
-        )
-
-        self.setMouseTracking(True)
-
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(SIZE, SIZE)
+        self.setMouseTracking(False)
 
-        # ------------------------------------------
-        # Animation state
-        # ------------------------------------------
+        self.theme_name = self.settings.value("theme", "Pastel Pink", type=str)
+        if self.theme_name not in THEMES:
+            self.theme_name = "Pastel Pink"
+        self.rotation_enabled = self.settings.value(
+            "rotation_enabled", True, type=bool
+        )
+        self.rotation_speed_level = self.settings.value(
+            "rotation_speed_level", 2, type=int
+        )
+        self.rotation_speed = self.speed_from_level(self.rotation_speed_level)
 
         self._progress = 0.0
-
         self.rotation = 0.0
-
         self.expanded = False
-
         self.rotation_paused = False
-
-        # ------------------------------------------
-        # Mouse state
-        # ------------------------------------------
-
-        self.hover_index = -1
-
         self.pressed_index = -1
-
+        self.press_position = QPointF()
+        self.press_global_position = None
         self.dragging = False
-
-        # ------------------------------------------
-        # System state
-        # ------------------------------------------
+        self.move_started = False
 
         self.wifi = "Unknown"
-
         self.bluetooth = "Unknown"
-
         self.battery = "N/A"
-
         self.battery_state = ""
-
         self.message = ""
 
-        # ------------------------------------------
-        # Expansion animation
-        # ------------------------------------------
-
-        self.animation = QPropertyAnimation(
-            self,
-            b"progress",
-            self,
-        )
-
-        self.animation.setDuration(450)
-
-        self.animation.setEasingCurve(
-            QEasingCurve.Type.OutCubic
-        )
-
-        # ------------------------------------------
-        # Main animation timer
-        # ------------------------------------------
+        self.animation = QPropertyAnimation(self, b"progress", self)
+        self.animation.setDuration(350)
+        self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
 
         self.frame_timer = QTimer(self)
-
-        self.frame_timer.setInterval(16)
-
-        self.frame_timer.timeout.connect(
-            self.animation_frame
-        )
-
+        self.frame_timer.setInterval(FRAME_INTERVAL_MS)
+        self.frame_timer.timeout.connect(self.animation_frame)
         self.frame_timer.start()
 
-        # ------------------------------------------
-        # System refresh timer
-        # ------------------------------------------
-
         self.status_timer = QTimer(self)
-
-        self.status_timer.timeout.connect(
-            self.refresh_status
-        )
-
-        self.status_timer.start(
-            REFRESH_INTERVAL
-        )
-
-        # ------------------------------------------
-        # Notification timer
-        # ------------------------------------------
+        self.status_timer.timeout.connect(self.refresh_status)
+        self.status_timer.start(STATUS_INTERVAL_MS)
 
         self.notification_timer = QTimer(self)
-
         self.notification_timer.setSingleShot(True)
-
-        self.notification_timer.timeout.connect(
-            self.clear_message
-        )
-
-        # ------------------------------------------
-        # Start
-        # ------------------------------------------
+        self.notification_timer.timeout.connect(self.clear_message)
 
         self.refresh_status()
 
-    # ==================================================
-    # ANIMATION PROPERTY
-    # ==================================================
+    @staticmethod
+    def speed_from_level(level: int) -> float:
+        # Level 2 is intentionally gentle: one full revolution takes about 2 minutes.
+        return 0.0009 * max(1, min(10, level)) / 2
+
+    @property
+    def palette(self):
+        return THEMES[self.theme_name]
 
     def get_progress(self):
         return self._progress
 
     def set_progress(self, value):
-
-        self._progress = max(
-            0.0,
-            min(1.0, value),
-        )
-
+        self._progress = max(0.0, min(1.0, float(value)))
         self.update()
 
-    progress = Property(
-        float,
-        get_progress,
-        set_progress,
-    )
+    progress = Property(float, get_progress, set_progress)
 
-    def expand(self, state):
-
+    def expand(self, state: bool):
         if self.expanded == state:
             return
-
         self.expanded = state
-
         self.animation.stop()
-
-        self.animation.setStartValue(
-            self._progress
-        )
-
-        self.animation.setEndValue(
-            1.0 if state else 0.0
-        )
-
+        self.animation.setStartValue(self._progress)
+        self.animation.setEndValue(1.0 if state else 0.0)
         self.animation.start()
 
+    def toggle_expanded(self):
+        self.expand(not self.expanded)
+
     def animation_frame(self):
-
-        if self.expanded and not self.rotation_paused:
-
-            self.rotation = (
-                self.rotation + ROTATION_SPEED
-            ) % (2 * math.pi)
-
+        if self.expanded and self.rotation_enabled and not self.rotation_paused:
+            self.rotation = (self.rotation + self.rotation_speed) % (2 * math.pi)
             self.update()
 
-    # ==================================================
-    # RADIAL POSITIONS
-    # ==================================================
-
     def get_positions(self):
-
-        positions = []
-
+        points = []
         for i in range(8):
-
-            angle = (
-                -math.pi / 2
-                + i * (math.pi / 4)
-                + self.rotation
-            )
-
-            radius = (
-                ORBIT_RADIUS * self._progress
-            )
-
-            x = CENTER.x() + math.cos(angle) * radius
-
-            y = CENTER.y() + math.sin(angle) * radius
-
-            positions.append(
-                QPointF(x, y)
-            )
-
-        return positions
+            angle = -math.pi / 2 + i * (math.pi / 4) + self.rotation
+            radius = ORBIT_RADIUS * self._progress
+            points.append(QPointF(
+                CENTER.x() + math.cos(angle) * radius,
+                CENTER.y() + math.sin(angle) * radius,
+            ))
+        return points
 
     @staticmethod
-    def distance(a, b):
-
-        return math.hypot(
-            a.x() - b.x(),
-            a.y() - b.y(),
-        )
-
-    # ==================================================
-    # PAINTING
-    # ==================================================
+    def distance(a: QPointF, b: QPointF) -> float:
+        return math.hypot(a.x() - b.x(), a.y() - b.y())
 
     def paintEvent(self, event):
-
         painter = QPainter(self)
-
-        painter.setRenderHint(
-            QPainter.RenderHint.Antialiasing
-        )
-
-        painter.setRenderHint(
-            QPainter.RenderHint.TextAntialiasing
-        )
-
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         self.draw_background(painter)
-
         if self._progress > 0.001:
-
             self.draw_flower(painter)
-
             self.draw_controls(painter)
-
         self.draw_center(painter)
-
         self.draw_notification(painter)
-
         painter.end()
 
-    # --------------------------------------------------
-    # BACKGROUND
-    # --------------------------------------------------
-
     def draw_background(self, painter):
-
-        progress = self._progress
-
-        if progress <= 0:
+        if self._progress <= 0:
             return
-
-        radius = 174 * progress
-
-        gradient = QLinearGradient(
-            30, 30, SIZE - 30, SIZE - 30
-        )
-
-        gradient.setColorAt(
-            0.0,
-            QColor(255, 241, 249, int(145 * progress)),
-        )
-
-        gradient.setColorAt(
-            1.0,
-            QColor(226, 213, 250, int(105 * progress)),
-        )
-
-        painter.setPen(
-            QPen(
-                QColor(255, 255, 255, int(175 * progress)),
-                1.4,
-            )
-        )
-
-        painter.setBrush(
-            QBrush(gradient)
-        )
-
-        painter.drawEllipse(
-            CENTER,
-            radius,
-            radius,
-        )
-
-    # --------------------------------------------------
-    # FLOWER PETALS
-    # --------------------------------------------------
+        p = self.palette
+        radius = 174 * self._progress
+        gradient = QLinearGradient(30, 30, SIZE - 30, SIZE - 30)
+        c1, c2 = QColor(p["background_start"]), QColor(p["background_end"])
+        c1.setAlpha(int(145 * self._progress))
+        c2.setAlpha(int(105 * self._progress))
+        gradient.setColorAt(0.0, c1)
+        gradient.setColorAt(1.0, c2)
+        outline = QColor(p["outline"])
+        outline.setAlpha(int(175 * self._progress))
+        painter.setPen(QPen(outline, 1.4))
+        painter.setBrush(QBrush(gradient))
+        painter.drawEllipse(CENTER, radius, radius)
 
     def draw_flower(self, painter):
-
-        progress = self._progress
-
-        # Eight petals surround the centre.
-
+        p = self.palette
         for i in range(8):
-
-            angle = (
-                -90
-                + i * 45
-                + math.degrees(self.rotation)
-            )
-
+            angle = -90 + i * 45 + math.degrees(self.rotation)
             painter.save()
-
             painter.translate(CENTER)
-
             painter.rotate(angle)
-
-            # Petals grow with expansion.
-
-            scale = progress
-
-            painter.scale(
-                scale,
-                scale,
-            )
-
-            painter.setPen(
-                QPen(
-                    QColor(255, 255, 255, 180),
-                    1.2,
-                )
-            )
-
-            painter.setBrush(
-                PINK if i % 2 == 0
-                else LAVENDER
-            )
-
-            painter.drawEllipse(
-                QRectF(
-                    -15,
-                    -94,
-                    30,
-                    63,
-                )
-            )
-
+            painter.scale(self._progress, self._progress)
+            outline = QColor(p["outline"])
+            outline.setAlpha(180)
+            painter.setPen(QPen(outline, 1.2))
+            painter.setBrush(QColor(p["petal_a"] if i % 2 == 0 else p["petal_b"]))
+            painter.drawEllipse(QRectF(-15, -94, 30, 63))
             painter.restore()
 
-    # --------------------------------------------------
-    # RADIAL BUTTONS
-    # --------------------------------------------------
-
     def draw_controls(self, painter):
-
-        positions = self.get_positions()
-
-        alpha = int(
-            min(255, self._progress * 255)
-        )
-
-        for i, pos in enumerate(positions):
-
-            hovered = (
-                i == self.hover_index
-            )
-
+        p = self.palette
+        alpha = int(min(255, self._progress * 255))
+        for i, pos in enumerate(self.get_positions()):
             painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(30, 25, 45, int(35 * self._progress)))
+            painter.drawEllipse(QPointF(pos.x() + 2, pos.y() + 3),
+                                BUTTON_RADIUS + 1, BUTTON_RADIUS + 1)
 
-            # Button shadow
+            outline = QColor(p["outline"])
+            outline.setAlpha(alpha)
+            painter.setPen(QPen(outline, 1.6))
+            painter.setBrush(QColor(p["button_a"] if i % 2 == 0 else p["button_b"]))
+            painter.drawEllipse(pos, BUTTON_RADIUS, BUTTON_RADIUS)
 
-            painter.setPen(
-                Qt.PenStyle.NoPen
-            )
-
-            painter.setBrush(
-                QColor(90, 65, 110, int(35 * self._progress))
-            )
-
-            painter.drawEllipse(
-                QPointF(pos.x() + 2, pos.y() + 3),
-                BUTTON_RADIUS + 1,
-                BUTTON_RADIUS + 1,
-            )
-
-            # Button body
-
-            painter.setPen(
-                QPen(
-                    QColor(255, 255, 255, alpha),
-                    1.6,
-                )
-            )
-
-            if hovered:
-
-                painter.setBrush(
-                    WHITE
-                )
-
-                radius = BUTTON_RADIUS + 3
-
-            else:
-
-                painter.setBrush(
-                    PINK if i % 2 == 0
-                    else LAVENDER
-                )
-
-                radius = BUTTON_RADIUS
-
-            painter.drawEllipse(
-                pos,
-                radius,
-                radius,
-            )
-
-            # Icon
-
-            painter.setPen(
-                TEXT
-            )
-
-            painter.setFont(
-                QFont(
-                    "DejaVu Sans",
-                    14,
-                    QFont.Weight.Bold,
-                )
-            )
-
+            painter.setPen(QColor(p["text"]))
+            painter.setFont(QFont("DejaVu Sans", 14, QFont.Weight.Bold))
             painter.drawText(
-                QRectF(
-                    pos.x() - 17,
-                    pos.y() - 17,
-                    34,
-                    34,
-                ),
-                Qt.AlignmentFlag.AlignCenter,
-                ICONS[i],
+                QRectF(pos.x() - 17, pos.y() - 17, 34, 34),
+                Qt.AlignmentFlag.AlignCenter, ICONS[i],
             )
-
-            # Labels
 
             if self._progress > 0.90:
-
-                label = self.get_label(i)
-
-                painter.setFont(
-                    QFont(
-                        "DejaVu Sans",
-                        8,
-                        QFont.Weight.DemiBold,
-                    )
-                )
-
-                painter.setPen(
-                    QColor(75, 58, 85, alpha)
-                )
-
+                painter.setFont(QFont("DejaVu Sans", 8, QFont.Weight.DemiBold))
+                painter.setPen(QColor(p["text"]))
                 painter.drawText(
-                    QRectF(
-                        pos.x() - 48,
-                        pos.y() + 32,
-                        96,
-                        20,
-                    ),
-                    Qt.AlignmentFlag.AlignCenter,
-                    label,
+                    QRectF(pos.x() - 48, pos.y() + 32, 96, 20),
+                    Qt.AlignmentFlag.AlignCenter, self.get_label(i),
                 )
-
             painter.restore()
 
     def get_label(self, index):
-
         if index == 0:
             return f"Wi-Fi: {self.wifi}"
-
         if index == 1:
             return f"BT: {self.bluetooth}"
-
         if index == 4:
-            return f"{self.battery} {self.battery_state}"
-
+            return f"{self.battery} {self.battery_state}".strip()
         return LABELS[index]
 
-    # --------------------------------------------------
-    # CENTRE FLOWER
-    # --------------------------------------------------
-
     def draw_center(self, painter):
-
+        p = self.palette
         painter.save()
-
-        # Shadow
-
-        painter.setPen(
-            Qt.PenStyle.NoPen
-        )
-
-        painter.setBrush(
-            QColor(90, 60, 100, 45)
-        )
-
-        painter.drawEllipse(
-            QPointF(
-                CENTER.x() + 2,
-                CENTER.y() + 4,
-            ),
-            ORB_RADIUS + 3,
-            ORB_RADIUS + 3,
-        )
-
-        # Centre body
-
-        painter.setPen(
-            QPen(
-                WHITE,
-                2,
-            )
-        )
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(30, 25, 45, 45))
+        painter.drawEllipse(QPointF(CENTER.x() + 2, CENTER.y() + 4),
+                            ORB_RADIUS + 3, ORB_RADIUS + 3)
 
         gradient = QLinearGradient(
-            CENTER.x() - ORB_RADIUS,
-            CENTER.y() - ORB_RADIUS,
-            CENTER.x() + ORB_RADIUS,
-            CENTER.y() + ORB_RADIUS,
+            CENTER.x() - ORB_RADIUS, CENTER.y() - ORB_RADIUS,
+            CENTER.x() + ORB_RADIUS, CENTER.y() + ORB_RADIUS,
         )
+        gradient.setColorAt(0.0, QColor(p["center_start"]))
+        gradient.setColorAt(1.0, QColor(p["center_end"]))
+        painter.setPen(QPen(QColor(p["outline"]), 2))
+        painter.setBrush(QBrush(gradient))
+        painter.drawEllipse(CENTER, ORB_RADIUS, ORB_RADIUS)
 
-        gradient.setColorAt(
-            0.0,
-            QColor("#FFE5EE"),
-        )
-
-        gradient.setColorAt(
-            1.0,
-            QColor("#E4D4FA"),
-        )
-
-        painter.setBrush(
-            QBrush(gradient)
-        )
-
-        painter.drawEllipse(
-            CENTER,
-            ORB_RADIUS,
-            ORB_RADIUS,
-        )
-
-        # Centre flower icon
-
-        painter.setPen(
-            QColor("#916A9E")
-        )
-
-        painter.setFont(
-            QFont(
-                "DejaVu Sans",
-                25,
-                QFont.Weight.Bold,
-            )
-        )
-
+        painter.setPen(QColor(p["center_icon"]))
+        painter.setFont(QFont("DejaVu Sans", 25, QFont.Weight.Bold))
+        glyph = "×" if self.expanded else "✿"
+        # Use a fallback ASCII flower if the selected font lacks the symbol.
         painter.drawText(
-            QRectF(
-                CENTER.x() - 25,
-                CENTER.y() - 26,
-                50,
-                52,
-            ),
-            Qt.AlignmentFlag.AlignCenter,
-            "*",
+            QRectF(CENTER.x() - 25, CENTER.y() - 26, 50, 52),
+            Qt.AlignmentFlag.AlignCenter, glyph,
         )
-
         painter.restore()
-
-    # --------------------------------------------------
-    # NOTIFICATIONS
-    # --------------------------------------------------
 
     def draw_notification(self, painter):
-
         if not self.message:
             return
-
+        p = self.palette
         painter.save()
-
-        painter.setPen(
-            Qt.PenStyle.NoPen
-        )
-
-        painter.setBrush(
-            QColor(255, 255, 255, 220)
-        )
-
-        painter.drawRoundedRect(
-            QRectF(100, 375, 220, 27),
-            12,
-            12,
-        )
-
-        painter.setPen(
-            TEXT
-        )
-
-        painter.setFont(
-            QFont(
-                "DejaVu Sans",
-                9,
-            )
-        )
-
-        painter.drawText(
-            QRectF(105, 375, 210, 27),
-            Qt.AlignmentFlag.AlignCenter,
-            self.message,
-        )
-
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(p["menu_bg"]))
+        painter.drawRoundedRect(QRectF(92, 375, 236, 27), 12, 12)
+        painter.setPen(QColor(p["menu_text"]))
+        painter.setFont(QFont("DejaVu Sans", 9))
+        painter.drawText(QRectF(97, 375, 226, 27),
+                         Qt.AlignmentFlag.AlignCenter, self.message)
         painter.restore()
 
-    def notify(self, message):
-
-        self.message = message[:55]
-
-        self.notification_timer.start(2500)
-
+    def notify(self, message: str):
+        self.message = message[:58]
+        self.notification_timer.start(2600)
         self.update()
 
     def clear_message(self):
-
         self.message = ""
-
         self.update()
 
-    # ==================================================
-    # MOUSE INTERACTION
-    # ==================================================
+    # Mouse interaction: no hover expansion or hover highlighting.
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.RightButton:
+            self.context_menu(event.globalPosition().toPoint())
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
 
-    def enterEvent(self, event):
-
-        self.expand(True)
-
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-
-        self.hover_index = -1
-
+        pos = QPointF(event.position())
+        self.press_position = pos
+        self.press_global_position = event.globalPosition().toPoint()
+        self.dragging = False
+        self.move_started = False
         self.pressed_index = -1
 
-        self.rotation_paused = False
+        if self.distance(pos, CENTER) <= ORB_RADIUS + 10:
+            self.rotation_paused = True
+            # On Wayland, the compositor must initiate the move from a mouse press.
+            handle = self.windowHandle()
+            if handle is not None:
+                self.move_started = bool(handle.startSystemMove())
+            event.accept()
+            return
 
-        self.expand(False)
-
-        self.unsetCursor()
-
-        self.update()
-
-        super().leaveEvent(event)
+        if self._progress > 0.90:
+            for i, point in enumerate(self.get_positions()):
+                if self.distance(pos, point) <= BUTTON_RADIUS + 12:
+                    self.pressed_index = i
+                    self.rotation_paused = True
+                    event.accept()
+                    return
 
     def mouseMoveEvent(self, event):
-
-        pos = QPointF(event.position())
-
-        if self.dragging:
+        if self.press_global_position is None:
             return
-
-        # Find hovered button.
-
-        self.hover_index = -1
-
-        if self._progress > 0.90:
-
-            for i, point in enumerate(
-                self.get_positions()
-            ):
-
-                if self.distance(
-                    pos,
-                    point,
-                ) < BUTTON_RADIUS + 12:
-
-                    self.hover_index = i
-
-                    break
-
-        # Pointer feedback
-
-        if self.hover_index >= 0:
-
-            self.setCursor(
-                Qt.CursorShape.PointingHandCursor
-            )
-
-        elif self.distance(
-            pos,
-            CENTER,
-        ) < ORB_RADIUS + 10:
-
-            self.setCursor(
-                Qt.CursorShape.OpenHandCursor
-            )
-
-        else:
-
-            self.unsetCursor()
-
-        self.update()
-
-    def mousePressEvent(self, event):
-
-        if event.button() == Qt.MouseButton.RightButton:
-
-            self.context_menu(
-                event.globalPosition().toPoint()
-            )
-
-            return
-
-        if event.button() != Qt.MouseButton.LeftButton:
-            return
-
-        pos = QPointF(event.position())
-
-        # Check centre first for dragging.
-
-        if self.distance(
-            pos,
-            CENTER,
-        ) < ORB_RADIUS + 10:
-
-            self.rotation_paused = True
-
-            handle = self.windowHandle()
-
-            if handle is not None:
-
-                # Native KDE / Wayland window movement.
-                # Must be initiated during mouse press.
-
-                if handle.startSystemMove():
-
-                    self.dragging = True
-
-                    return
-
-            self.notify(
-                "Window movement unavailable"
-            )
-
-            return
-
-        # Check radial buttons.
-
-        if self._progress > 0.90:
-
-            for i, point in enumerate(
-                self.get_positions()
-            ):
-
-                if self.distance(
-                    pos,
-                    point,
-                ) < BUTTON_RADIUS + 12:
-
-                    self.pressed_index = i
-
-                    self.rotation_paused = True
-
-                    return
+        current = event.globalPosition().toPoint()
+        dx = current.x() - self.press_global_position.x()
+        dy = current.y() - self.press_global_position.y()
+        if math.hypot(dx, dy) >= DRAG_THRESHOLD and self.distance(
+            self.press_position, CENTER
+        ) <= ORB_RADIUS + 10:
+            self.dragging = True
+        # The compositor handles the actual movement after startSystemMove().
+        event.accept()
 
     def mouseReleaseEvent(self, event):
-
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
-        if self.dragging:
-
-            self.dragging = False
-
-            self.rotation_paused = False
-
-            return
+        if self.press_global_position is not None:
+            if self.distance(self.press_position, CENTER) <= ORB_RADIUS + 10:
+                was_drag = self.dragging
+                self.press_global_position = None
+                self.rotation_paused = False
+                self.dragging = False
+                if not was_drag:
+                    self.toggle_expanded()
+                self.update()
+                event.accept()
+                return
 
         if self.pressed_index >= 0:
-
             index = self.pressed_index
-
             self.pressed_index = -1
-
-            if self._progress > 0.90:
-
-                positions = self.get_positions()
-
-                if self.distance(
-                    QPointF(event.position()),
-                    positions[index],
-                ) < BUTTON_RADIUS + 14:
-
-                    self.activate(index)
-
+            if self._progress > 0.90 and self.distance(
+                QPointF(event.position()), self.get_positions()[index]
+            ) <= BUTTON_RADIUS + 14:
+                self.activate(index)
             self.rotation_paused = False
-
             self.update()
+        self.press_global_position = None
+        event.accept()
 
-    # ==================================================
-    # SYSTEM STATUS
-    # ==================================================
+    def mouseDoubleClickEvent(self, event):
+        # Treat a double-click as two deliberate centre clicks, without a special action.
+        event.accept()
 
+    # System status
     def refresh_status(self):
-
         self.refresh_wifi()
-
         self.refresh_bluetooth()
-
         self.refresh_battery()
-
         self.update()
 
     def refresh_wifi(self):
-
         if not has_command("nmcli"):
-
             self.wifi = "N/A"
-
             return
-
-        state = get_output(
-            [
-                "nmcli",
-                "radio",
-                "wifi",
-            ],
-            "unknown",
+        state = get_output(["nmcli", "radio", "wifi"], "unknown").lower()
+        self.wifi = "On" if state == "enabled" else (
+            "Off" if state == "disabled" else "Unknown"
         )
-
-        if state.lower() == "enabled":
-
-            self.wifi = "On"
-
-        elif state.lower() == "disabled":
-
-            self.wifi = "Off"
-
-        else:
-
-            self.wifi = "Unknown"
 
     def refresh_bluetooth(self):
-
         if not has_command("bluetoothctl"):
-
             self.bluetooth = "N/A"
-
             return
-
-        result = run_command(
-            [
-                "bluetoothctl",
-                "show",
-            ]
-        )
-
+        result = run_command(["bluetoothctl", "show"])
         if result is None:
-
             self.bluetooth = "Unknown"
-
             return
-
-        text = result.stdout.lower()
-
-        if "powered: yes" in text:
-
+        output = result.stdout.lower()
+        if "powered: yes" in output:
             self.bluetooth = "On"
-
-        elif "powered: no" in text:
-
+        elif "powered: no" in output:
             self.bluetooth = "Off"
-
-        elif "no default controller" in text:
-
+        elif "no default controller" in output:
             self.bluetooth = "N/A"
-
         else:
-
             self.bluetooth = "Unknown"
 
     def refresh_battery(self):
-
-        batteries = list(
-            Path(
-                "/sys/class/power_supply"
-            ).glob("BAT*")
-        )
-
-        for battery in batteries:
-
+        for battery in Path("/sys/class/power_supply").glob("BAT*"):
             try:
-
-                capacity = (
-                    battery / "capacity"
-                ).read_text().strip()
-
-                state = (
-                    battery / "status"
-                ).read_text().strip()
-
+                capacity = (battery / "capacity").read_text().strip()
+                state = (battery / "status").read_text().strip()
                 if capacity.isdigit():
-
                     self.battery = capacity + "%"
-
                     self.battery_state = state
-
                     return
-
             except OSError:
-
                 continue
-
         self.battery = "N/A"
-
         self.battery_state = ""
 
-    # ==================================================
-    # COMMAND EXECUTION
-    # ==================================================
-
     def execute(self, args, success_message):
-
         if not has_command(args[0]):
-
-            self.notify(
-                f"Missing: {args[0]}"
-            )
-
+            self.notify(f"Missing command: {args[0]}")
             return False
-
         result = run_command(args)
-
         if result is None:
-
-            self.notify(
-                "Command execution failed"
-            )
-
+            self.notify("Command execution failed")
             return False
-
         if result.returncode != 0:
-
             error = result.stderr.strip()
-
-            if error:
-
-                self.notify(
-                    error.splitlines()[-1][:55]
-                )
-
-            else:
-
-                self.notify(
-                    "Operation failed"
-                )
-
+            self.notify(error.splitlines()[-1][:58] if error else "Operation failed")
             return False
-
         self.notify(success_message)
-
-        QTimer.singleShot(
-            700,
-            self.refresh_status,
-        )
-
+        QTimer.singleShot(700, self.refresh_status)
         return True
 
-    # ==================================================
-    # CONTROL ACTIONS
-    # ==================================================
-
     def activate(self, index):
-
-        if index == 0:
-
-            self.toggle_wifi()
-
-        elif index == 1:
-
-            self.toggle_bluetooth()
-
-        elif index == 2:
-
-            self.change_volume("-5%")
-
-        elif index == 3:
-
-            self.change_volume("+5%")
-
-        elif index == 4:
-
-            self.notify(
-                f"Battery: {self.battery}"
-                + (
-                    f" ({self.battery_state})"
-                    if self.battery_state else ""
-                )
-            )
-
-        elif index == 5:
-
-            self.change_brightness("5%-")
-
-        elif index == 6:
-
-            self.change_brightness("5%+")
-
-        elif index == 7:
-
-            self.open_settings()
-
-    # --------------------------------------------------
-    # WI-FI
-    # --------------------------------------------------
+        actions = {
+            0: self.toggle_wifi,
+            1: self.toggle_bluetooth,
+            2: lambda: self.change_volume("-5%"),
+            3: lambda: self.change_volume("+5%"),
+            4: self.show_battery,
+            5: lambda: self.change_brightness("5%-"),
+            6: lambda: self.change_brightness("5%+"),
+            7: self.open_widget_settings,
+        }
+        action = actions.get(index)
+        if action:
+            action()
 
     def toggle_wifi(self):
-
         if self.wifi not in ("On", "Off"):
-
-            self.notify(
-                "Wi-Fi status unavailable"
-            )
-
+            self.notify("Wi-Fi status unavailable")
             return
-
-        state = (
-            "off" if self.wifi == "On"
-            else "on"
-        )
-
-        self.execute(
-            [
-                "nmcli",
-                "radio",
-                "wifi",
-                state,
-            ],
-            f"Wi-Fi {state.upper()}",
-        )
-
-    # --------------------------------------------------
-    # BLUETOOTH
-    # --------------------------------------------------
+        state = "off" if self.wifi == "On" else "on"
+        self.execute(["nmcli", "radio", "wifi", state], f"Wi-Fi {state.upper()}")
 
     def toggle_bluetooth(self):
-
         if self.bluetooth not in ("On", "Off"):
-
-            self.notify(
-                "Bluetooth unavailable"
-            )
-
+            self.notify("Bluetooth unavailable")
             return
-
-        state = (
-            "off" if self.bluetooth == "On"
-            else "on"
-        )
-
-        self.execute(
-            [
-                "bluetoothctl",
-                "power",
-                state,
-            ],
-            f"Bluetooth {state.upper()}",
-        )
-
-    # --------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------
+        state = "off" if self.bluetooth == "On" else "on"
+        self.execute(["bluetoothctl", "power", state], f"Bluetooth {state.upper()}")
 
     def change_volume(self, amount):
-
         if has_command("wpctl"):
-
-            value = (
-                "5%+" if amount == "+5%"
-                else "5%-"
-            )
-
+            value = "5%+" if amount == "+5%" else "5%-"
             self.execute(
-                [
-                    "wpctl",
-                    "set-volume",
-                    "@DEFAULT_AUDIO_SINK@",
-                    value,
-                ],
+                ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", value],
                 f"Volume {amount}",
             )
-
         elif has_command("pactl"):
-
             self.execute(
-                [
-                    "pactl",
-                    "set-sink-volume",
-                    "@DEFAULT_SINK@",
-                    amount,
-                ],
+                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", amount],
                 f"Volume {amount}",
             )
-
         else:
-
-            self.notify(
-                "Audio control unavailable"
-            )
-
-    # --------------------------------------------------
-    # BRIGHTNESS
-    # --------------------------------------------------
+            self.notify("Audio control unavailable")
 
     def change_brightness(self, amount):
-
         if not has_command("brightnessctl"):
-
-            self.notify(
-                "Install brightnessctl"
-            )
-
+            self.notify("Install brightnessctl")
             return
+        self.execute(["brightnessctl", "set", amount], f"Brightness {amount}")
 
-        self.execute(
-            [
-                "brightnessctl",
-                "set",
-                amount,
-            ],
-            f"Brightness {amount}",
+    def show_battery(self):
+        self.refresh_battery()
+        detail = f"Battery: {self.battery}"
+        if self.battery_state:
+            detail += f" ({self.battery_state})"
+        self.notify(detail)
+
+    def open_widget_settings(self):
+        dialog = WidgetSettingsDialog(self.settings, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            dialog.save_preferences()
+            self.apply_preferences()
+            self.notify("Widget settings saved")
+
+    def apply_preferences(self):
+        self.theme_name = self.settings.value("theme", "Pastel Pink", type=str)
+        if self.theme_name not in THEMES:
+            self.theme_name = "Pastel Pink"
+        self.rotation_enabled = self.settings.value(
+            "rotation_enabled", True, type=bool
         )
+        self.rotation_speed_level = self.settings.value(
+            "rotation_speed_level", 2, type=int
+        )
+        self.rotation_speed = self.speed_from_level(self.rotation_speed_level)
+        self.update()
 
-    # --------------------------------------------------
-    # KDE SETTINGS
-    # --------------------------------------------------
-
-    def open_settings(self):
-
+    def open_kde_settings(self):
         if launch_application("systemsettings"):
-
-            self.notify(
-                "Opening KDE Settings"
-            )
-
+            self.notify("Opening KDE System Settings")
         else:
-
-            self.notify(
-                "KDE Settings not found"
-            )
-
-    # ==================================================
-    # CONTEXT MENU
-    # ==================================================
+            self.notify("KDE System Settings not found")
 
     def context_menu(self, point):
-
+        p = self.palette
         menu = QMenu(self)
-
-        menu.setStyleSheet("""
-            QMenu {
-                background: #FFF5FA;
-                color: #594563;
-                border: 1px solid #E8D6ED;
-                border-radius: 10px;
+        menu.setStyleSheet(f"""
+            QMenu {{
+                background: {p['menu_bg']}; color: {p['menu_text']};
+                border: 1px solid {p['accent']}; border-radius: 10px;
                 padding: 6px;
-            }
-
-            QMenu::item {
-                padding: 8px 22px;
-                border-radius: 5px;
-            }
-
-            QMenu::item:selected {
-                background: #E8D9F5;
-            }
-
-            QMenu::separator {
-                height: 1px;
-                background: #E8D6ED;
-                margin: 5px 8px;
-            }
+            }}
+            QMenu::item {{ padding: 8px 22px; border-radius: 5px; }}
+            QMenu::item:selected {{ background: {p['menu_selected']}; }}
+            QMenu::separator {{ height: 1px; background: {p['accent']}; margin: 5px 8px; }}
         """)
+        settings_action = QAction("Cozy Orbit Widget Settings…", menu)
+        settings_action.triggered.connect(self.open_widget_settings)
+        menu.addAction(settings_action)
 
-        refresh = QAction(
-            "Refresh status",
-            menu,
-        )
-
-        refresh.triggered.connect(
-            self.refresh_status
-        )
-
-        menu.addAction(refresh)
+        refresh_action = QAction("Refresh device status", menu)
+        refresh_action.triggered.connect(self.refresh_status)
+        menu.addAction(refresh_action)
 
         menu.addSeparator()
-
-        settings = QAction(
-            "KDE System Settings",
-            menu,
-        )
-
-        settings.triggered.connect(
-            self.open_settings
-        )
-
-        menu.addAction(settings)
+        kde_action = QAction("KDE System Settings", menu)
+        kde_action.triggered.connect(self.open_kde_settings)
+        menu.addAction(kde_action)
 
         menu.addSeparator()
-
-        quit_action = QAction(
-            "Quit Cozy Orbit",
-            menu,
-        )
-
-        quit_action.triggered.connect(
-            QApplication.quit
-        )
-
+        quit_action = QAction("Quit Cozy Orbit", menu)
+        quit_action.triggered.connect(QApplication.quit)
         menu.addAction(quit_action)
-
         menu.exec(point)
 
-    # ==================================================
-    # CLEANUP
-    # ==================================================
-
     def closeEvent(self, event):
-
         self.frame_timer.stop()
-
         self.status_timer.stop()
-
         self.notification_timer.stop()
-
         self.animation.stop()
-
         event.accept()
 
 
-# ==================================================
-# APPLICATION ENTRY
-# ==================================================
-
 def main():
-
     app = QApplication(sys.argv)
-
     app.setApplicationName(APP_NAME)
-
-    app.setApplicationVersion(VERSION)
-
+    app.setApplicationVersion(APP_VERSION)
+    app.setOrganizationName(ORG_NAME)
+    app.setOrganizationDomain(SETTINGS_DOMAIN)
     app.setQuitOnLastWindowClosed(True)
 
     widget = CozyOrbit()
-
     widget.show()
-
     return app.exec()
 
 
 if __name__ == "__main__":
-
     try:
-
         sys.exit(main())
-
     except Exception as exc:
-
-        print(
-            f"Cozy Orbit error: {exc}",
-            file=sys.stderr,
-        )
-
+        print(f"{APP_NAME} error: {exc}", file=sys.stderr)
         raise
