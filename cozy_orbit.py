@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.8.0
+Cozy Orbit v0.9.0
 A customisable radial desktop control widget for KDE Plasma 6 (Wayland/X11).
 
 Requirements:
@@ -15,32 +15,51 @@ Run:
     python cozy_orbit.py
 
 User preferences are stored using QSettings.
+
+What's new in 0.9.0:
+    * System commands run in background threads, so the widget never freezes
+      while nmcli / bluetoothctl / brightnessctl are working.
+    * Status polling and the animation timer only run while the orbit is open.
+    * Rotation is time-based (same speed on any refresh rate / system load).
+    * Volume and brightness show the real level after each change; volume is
+      capped at 100% on PipeWire; right-click Vol -/+ to mute.
+    * Wi-Fi / Bluetooth buttons dim when off; battery shows a charging bolt.
+    * Sharp icons on HiDPI screens.
+    * Remembers its position (X11), only one instance can run at a time,
+      Escape closes the orbit, optional "Start at login", live theme preview.
+    * Renamed the `palette` property (it shadowed QWidget.palette()).
 """
 
 from __future__ import annotations
 
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import (
-    Qt, QPointF, QRectF, QTimer, QEasingCurve,
-    QPropertyAnimation, Property, QSettings,
+    Qt, QPoint, QPointF, QRectF, QTimer, QEasingCurve,
+    QPropertyAnimation, Property, QSettings, QLockFile, Signal,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QPainter, QPen, QBrush, QLinearGradient, QIcon, QPixmap,
+    QAction, QColor, QFont, QGuiApplication, QPainter, QPen, QBrush,
+    QLinearGradient, QIcon, QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMenu, QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QSlider, QCheckBox, QDialogButtonBox,
-    QFormLayout, QGroupBox, QPushButton, QMessageBox,
+    QFormLayout, QGroupBox, QMessageBox,
 )
 
 APP_NAME = "Cozy Orbit"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.9.0"
 ORG_NAME = "CozyOrbit"
 SETTINGS_DOMAIN = "cozy-orbit"
 
@@ -49,9 +68,12 @@ CENTER = QPointF(SIZE / 2, SIZE / 2)
 ORB_RADIUS = 34
 BUTTON_RADIUS = 26
 ORBIT_RADIUS = 137
+ICON_SIZE = 28
 FRAME_INTERVAL_MS = 16
 STATUS_INTERVAL_MS = 3000
 DRAG_THRESHOLD = 8
+# Radians per second for each speed level (level 2 ≈ one revolution / 2 min).
+ROTATION_RAD_PER_SEC_PER_LEVEL = 0.027
 
 LABELS = [
     "Wi-Fi", "Bluetooth", "Volume Down", "Volume Up",
@@ -70,15 +92,6 @@ SYSTEM_ICON_CANDIDATES = [
     ("preferences-system", "settings-configure"),
 ]
 ICON_FALLBACKS = ["W", "B", "−", "+", "%", "−", "+", "⚙"]
-
-
-def desktop_icon(candidates: tuple[str, ...]) -> QIcon:
-    """Return the first icon available in the user's current desktop theme."""
-    for name in candidates:
-        icon = QIcon.fromTheme(name)
-        if not icon.isNull():
-            return icon
-    return QIcon()
 
 THEMES = {
     "Pastel Pink": {
@@ -134,6 +147,23 @@ THEMES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Helpers (no Qt widgets involved, safe to call from worker threads)
+# ---------------------------------------------------------------------------
+
+def desktop_icon(candidates: tuple[str, ...]) -> QIcon:
+    """Return the first icon available in the user's current desktop theme."""
+    for name in candidates:
+        icon = QIcon.fromTheme(name)
+        if not icon.isNull():
+            return icon
+    return QIcon()
+
+
+def is_wayland() -> bool:
+    return QGuiApplication.platformName().lower().startswith("wayland")
+
+
 def has_command(name: str) -> bool:
     return shutil.which(name) is not None
 
@@ -168,6 +198,100 @@ def launch_application(name: str, arguments: tuple[str, ...] = ()) -> bool:
         return False
 
 
+def query_wifi() -> str:
+    if not has_command("nmcli"):
+        return "N/A"
+    state = get_output(["nmcli", "radio", "wifi"], "unknown").lower()
+    if state == "enabled":
+        return "On"
+    if state == "disabled":
+        return "Off"
+    return "Unknown"
+
+
+def query_bluetooth() -> str:
+    if not has_command("bluetoothctl"):
+        return "N/A"
+    result = run_command(["bluetoothctl", "show"])
+    if result is None:
+        return "Unknown"
+    output = result.stdout.lower()
+    if "powered: yes" in output:
+        return "On"
+    if "powered: no" in output:
+        return "Off"
+    if "no default controller" in output:
+        return "N/A"
+    return "Unknown"
+
+
+def read_volume() -> str:
+    """Human-readable current volume, e.g. 'Volume 45%' or 'Volume 45% (muted)'."""
+    if has_command("wpctl"):
+        out = get_output(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
+        match = re.search(r"([\d.]+)", out)
+        if match:
+            pct = round(float(match.group(1)) * 100)
+            return f"Volume {pct}%" + (" (muted)" if "MUTED" in out else "")
+    elif has_command("pactl"):
+        out = get_output(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
+        match = re.search(r"(\d+)%", out)
+        if match:
+            muted = "yes" in get_output(["pactl", "get-sink-mute", "@DEFAULT_SINK@"]).lower()
+            return f"Volume {match.group(1)}%" + (" (muted)" if muted else "")
+    return "Volume changed"
+
+
+def read_brightness() -> str:
+    out = get_output(["brightnessctl", "-m"])
+    fields = out.split(",")
+    if len(fields) >= 4 and fields[3].endswith("%"):
+        return f"Brightness {fields[3]}"
+    return "Brightness changed"
+
+
+def autostart_file() -> Path:
+    config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return config / "autostart" / "cozy-orbit.desktop"
+
+
+def autostart_enabled() -> bool:
+    return autostart_file().exists()
+
+
+def set_autostart(enabled: bool) -> bool:
+    path = autostart_file()
+    try:
+        if enabled:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            script = Path(__file__).resolve()
+            path.write_text(
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                f"Name={APP_NAME}\n"
+                "Comment=Radial desktop control widget\n"
+                f'Exec="{sys.executable}" "{script}"\n'
+                "Terminal=false\n"
+                "X-KDE-autostart-after=panel\n"
+            )
+        else:
+            path.unlink(missing_ok=True)
+        return True
+    except OSError:
+        return False
+
+
+@dataclass
+class JobResult:
+    ok: bool
+    message: str
+    permission_error: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Settings dialog
+# ---------------------------------------------------------------------------
+
 class WidgetSettingsDialog(QDialog):
     """Preferences dialog for Cozy Orbit itself."""
 
@@ -191,6 +315,9 @@ class WidgetSettingsDialog(QDialog):
         self.theme_combo.setCurrentText(
             settings.value("theme", "Pastel Pink", type=str)
         )
+        # Connected after the initial value is set so opening the dialog
+        # doesn't trigger a preview.
+        self.theme_combo.currentTextChanged.connect(self.preview_theme)
         appearance_form.addRow("Colour theme", self.theme_combo)
         root.addWidget(appearance)
 
@@ -221,6 +348,13 @@ class WidgetSettingsDialog(QDialog):
         self.update_speed_label(self.speed_slider.value())
         root.addWidget(motion)
 
+        startup = QGroupBox("Startup")
+        startup_layout = QVBoxLayout(startup)
+        self.autostart_check = QCheckBox("Start Cozy Orbit when I log in")
+        self.autostart_check.setChecked(autostart_enabled())
+        startup_layout.addWidget(self.autostart_check)
+        root.addWidget(startup)
+
         info = QLabel(
             "Changes are saved on this device and applied immediately. "
             "The widget's right-click menu also contains refresh and quit."
@@ -246,6 +380,18 @@ class WidgetSettingsDialog(QDialog):
             QPushButton { padding: 6px 14px; }
         """)
 
+    def preview_theme(self, name: str):
+        parent = self.parent()
+        if hasattr(parent, "preview_theme"):
+            parent.preview_theme(name)
+
+    def reject(self):
+        # Undo any live theme preview.
+        parent = self.parent()
+        if hasattr(parent, "apply_preferences"):
+            parent.apply_preferences()
+        super().reject()
+
     def update_speed_label(self, value: int):
         labels = {
             1: "Very slow", 2: "Slow", 3: "Gentle", 4: "Relaxed",
@@ -254,14 +400,27 @@ class WidgetSettingsDialog(QDialog):
         }
         self.speed_value.setText(labels.get(value, "Slow"))
 
-    def save_preferences(self):
+    def save_preferences(self) -> bool:
+        """Persist settings. Returns False if the autostart entry failed."""
         self.settings.setValue("theme", self.theme_combo.currentText())
         self.settings.setValue("rotation_enabled", self.rotate_check.isChecked())
         self.settings.setValue("rotation_speed_level", self.speed_slider.value())
         self.settings.sync()
+        wanted = self.autostart_check.isChecked()
+        if wanted != autostart_enabled():
+            return set_autostart(wanted)
+        return True
 
+
+# ---------------------------------------------------------------------------
+# Main widget
+# ---------------------------------------------------------------------------
 
 class CozyOrbit(QWidget):
+    # Emitted from worker threads; delivered on the GUI thread.
+    status_ready = Signal(dict)
+    job_finished = Signal(object)
+
     def __init__(self):
         super().__init__()
         self.settings = QSettings(ORG_NAME, SETTINGS_DOMAIN)
@@ -273,6 +432,7 @@ class CozyOrbit(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFixedSize(SIZE, SIZE)
         self.setMouseTracking(False)
         # Resolve icons from the desktop's active icon theme (normally KDE Breeze).
@@ -300,9 +460,18 @@ class CozyOrbit(QWidget):
         self.press_window_position = None
         self.dragging = False
         self.move_started = False
+        self._last_frame = time.monotonic()
+        self._status_busy = False
+
         self.rotation_resume_timer = QTimer(self)
         self.rotation_resume_timer.setSingleShot(True)
         self.rotation_resume_timer.timeout.connect(self.resume_rotation)
+
+        self.position_timer = QTimer(self)
+        self.position_timer.setSingleShot(True)
+        self.position_timer.setInterval(600)
+        self.position_timer.timeout.connect(self.save_position)
+        self.restore_position()
 
         self.wifi = "Unknown"
         self.bluetooth = "Unknown"
@@ -310,24 +479,28 @@ class CozyOrbit(QWidget):
         self.battery_state = ""
         self.message = ""
 
+        self.status_ready.connect(self.apply_status)
+        self.job_finished.connect(self.on_job_finished)
+
         self.animation = QPropertyAnimation(self, b"progress", self)
         self.animation.setDuration(350)
         self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self.animation.finished.connect(self.update_frame_timer)
 
         self._flower_openness = 0.18
         self.flower_animation = QPropertyAnimation(self, b"flowerOpenness", self)
         self.flower_animation.setDuration(420)
         self.flower_animation.setEasingCurve(QEasingCurve.Type.OutBack)
 
+        # The frame timer only runs while the orbit is open and rotating.
         self.frame_timer = QTimer(self)
         self.frame_timer.setInterval(FRAME_INTERVAL_MS)
         self.frame_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.frame_timer.timeout.connect(self.animation_frame)
-        # Start after the window is shown; this avoids an occasional missed
-        # first animation frame during Wayland window initialisation.
 
+        # Status polling only happens while the orbit is open (see poll_status).
         self.status_timer = QTimer(self)
-        self.status_timer.timeout.connect(self.refresh_status)
+        self.status_timer.timeout.connect(self.poll_status)
         self.status_timer.start(STATUS_INTERVAL_MS)
 
         self.notification_timer = QTimer(self)
@@ -336,33 +509,82 @@ class CozyOrbit(QWidget):
 
         self.refresh_status()
 
+    # ----- configuration ---------------------------------------------------
+
     @staticmethod
     def speed_from_level(level: int) -> float:
-        # Level 2 is intentionally gentle: one full revolution takes about 2 minutes.
-        return 0.0009 * max(1, min(10, level)) / 2
+        """Radians per second. Level 2 is gentle: ~2 minutes per revolution."""
+        return ROTATION_RAD_PER_SEC_PER_LEVEL * max(1, min(10, level))
 
     def make_tinted_icons(self):
-        """Tint desktop-theme icons to match the current theme's readable text colour."""
+        """Tint desktop-theme icons to the theme's text colour, HiDPI-aware."""
         tint = QColor(THEMES[self.theme_name]["text"])
+        dpr = max(1.0, self.devicePixelRatioF())
+        px = int(ICON_SIZE * dpr)
         pixmaps = []
         for icon in self.system_icons:
             if icon.isNull():
                 pixmaps.append(QPixmap())
                 continue
-            source = icon.pixmap(32, 32)
+            source = icon.pixmap(px, px)
+            source.setDevicePixelRatio(dpr)
             tinted = QPixmap(source.size())
+            tinted.setDevicePixelRatio(dpr)
             tinted.fill(Qt.GlobalColor.transparent)
             painter = QPainter(tinted)
             painter.drawPixmap(0, 0, source)
             painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
-            painter.fillRect(tinted.rect(), tint)
+            painter.fillRect(QRectF(0, 0, ICON_SIZE, ICON_SIZE), tint)
             painter.end()
             pixmaps.append(tinted)
         return pixmaps
 
     @property
-    def palette(self):
+    def theme(self):
+        # Not called "palette": that would shadow QWidget.palette().
         return THEMES[self.theme_name]
+
+    def preview_theme(self, name: str):
+        if name in THEMES:
+            self.theme_name = name
+            self.tinted_icons = self.make_tinted_icons()
+            self.update()
+
+    def apply_preferences(self):
+        self.theme_name = self.settings.value("theme", "Pastel Pink", type=str)
+        if self.theme_name not in THEMES:
+            self.theme_name = "Pastel Pink"
+        self.rotation_enabled = self.settings.value(
+            "rotation_enabled", True, type=bool
+        )
+        self.rotation_speed_level = self.settings.value(
+            "rotation_speed_level", 2, type=int
+        )
+        self.rotation_speed = self.speed_from_level(self.rotation_speed_level)
+        self.tinted_icons = self.make_tinted_icons()
+        self.update_frame_timer()
+        self.update()
+
+    # ----- window position -------------------------------------------------
+
+    def restore_position(self):
+        # Wayland compositors decide window placement; only restore on X11.
+        if is_wayland():
+            return
+        saved = self.settings.value("position")
+        if isinstance(saved, QPoint):
+            if QGuiApplication.screenAt(saved + QPoint(SIZE // 2, SIZE // 2)):
+                self.move(saved)
+
+    def save_position(self):
+        if not is_wayland():
+            self.settings.setValue("position", self.pos())
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self.position_timer.start()
+
+    # ----- animated properties --------------------------------------------
 
     def get_progress(self):
         return self._progress
@@ -394,13 +616,30 @@ class CozyOrbit(QWidget):
         self.flower_animation.setStartValue(self._flower_openness)
         self.flower_animation.setEndValue(1.0 if state else 0.18)
         self.flower_animation.start()
+        self.update_frame_timer()
+        if state:
+            self.refresh_status()
 
     def toggle_expanded(self):
         self.expand(not self.expanded)
 
+    def update_frame_timer(self):
+        """Run the frame timer only while there is something to animate."""
+        should_run = self.rotation_enabled and (
+            self.expanded or self._progress > 0.001
+        )
+        if should_run and not self.frame_timer.isActive():
+            self._last_frame = time.monotonic()
+            self.frame_timer.start()
+        elif not should_run and self.frame_timer.isActive():
+            self.frame_timer.stop()
+
     def animation_frame(self):
-        if self.expanded and self.rotation_enabled and not self.rotation_paused:
-            self.rotation = (self.rotation + self.rotation_speed) % (2 * math.pi)
+        now = time.monotonic()
+        dt = min(now - self._last_frame, 0.1)  # clamp after stalls/suspend
+        self._last_frame = now
+        if self.rotation_enabled and not self.rotation_paused and self._progress > 0.001:
+            self.rotation = (self.rotation + self.rotation_speed * dt) % (2 * math.pi)
             self.update()
 
     def get_positions(self):
@@ -418,10 +657,13 @@ class CozyOrbit(QWidget):
     def distance(a: QPointF, b: QPointF) -> float:
         return math.hypot(a.x() - b.x(), a.y() - b.y())
 
+    # ----- painting --------------------------------------------------------
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.draw_background(painter)
         if self._progress > 0.001:
             self.draw_flower(painter)
@@ -433,7 +675,7 @@ class CozyOrbit(QWidget):
     def draw_background(self, painter):
         if self._progress <= 0:
             return
-        p = self.palette
+        p = self.theme
         radius = 174 * self._progress
         gradient = QLinearGradient(30, 30, SIZE - 30, SIZE - 30)
         c1, c2 = QColor(p["background_start"]), QColor(p["background_end"])
@@ -448,7 +690,7 @@ class CozyOrbit(QWidget):
         painter.drawEllipse(CENTER, radius, radius)
 
     def draw_flower(self, painter):
-        p = self.palette
+        p = self.theme
         for i in range(8):
             angle = -90 + i * 45 + math.degrees(self.rotation)
             painter.save()
@@ -462,11 +704,21 @@ class CozyOrbit(QWidget):
             painter.drawEllipse(QRectF(-15, -94, 30, 63))
             painter.restore()
 
+    def button_is_dim(self, index: int) -> bool:
+        """Wi-Fi / Bluetooth buttons fade when the radio is off or unavailable."""
+        if index == 0:
+            return self.wifi in ("Off", "N/A")
+        if index == 1:
+            return self.bluetooth in ("Off", "N/A")
+        return False
+
     def draw_controls(self, painter):
-        p = self.palette
+        p = self.theme
         alpha = int(min(255, self._progress * 255))
         for i, pos in enumerate(self.get_positions()):
             painter.save()
+            if self.button_is_dim(i):
+                painter.setOpacity(0.5)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(30, 25, 45, int(35 * self._progress)))
             painter.drawEllipse(QPointF(pos.x() + 2, pos.y() + 3),
@@ -479,7 +731,8 @@ class CozyOrbit(QWidget):
             painter.drawEllipse(pos, BUTTON_RADIUS, BUTTON_RADIUS)
 
             icon = self.tinted_icons[i]
-            icon_rect = QRectF(pos.x() - 14, pos.y() - 14, 28, 28)
+            icon_rect = QRectF(pos.x() - ICON_SIZE / 2, pos.y() - ICON_SIZE / 2,
+                               ICON_SIZE, ICON_SIZE)
             if not icon.isNull():
                 painter.drawPixmap(icon_rect.toRect(), icon)
             else:
@@ -507,11 +760,11 @@ class CozyOrbit(QWidget):
         if index == 1:
             return f"BT {self.bluetooth}"
         if index == 4:
-            return self.battery
+            return self.battery + (" ⚡" if self.battery_state == "Charging" else "")
         return compact[index]
 
     def draw_center(self, painter):
-        p = self.palette
+        p = self.theme
         painter.save()
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(30, 25, 45, 45))
@@ -549,7 +802,7 @@ class CozyOrbit(QWidget):
     def draw_notification(self, painter):
         if not self.message:
             return
-        p = self.palette
+        p = self.theme
         painter.save()
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(p["menu_bg"]))
@@ -569,14 +822,26 @@ class CozyOrbit(QWidget):
         self.message = ""
         self.update()
 
-    # Mouse interaction: no hover expansion or hover highlighting.
+    # ----- mouse / keyboard ------------------------------------------------
+    # No hover expansion or hover highlighting.
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.expanded:
+            self.expand(False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
             pos = QPointF(event.position())
             if self._progress > 0.90:
-                for index, point in enumerate(self.get_positions()[:2]):
+                for index, point in enumerate(self.get_positions()[:4]):
                     if self.distance(pos, point) <= BUTTON_RADIUS + 12:
-                        self.open_device_settings("wifi" if index == 0 else "bluetooth")
+                        if index < 2:
+                            self.open_device_settings("wifi" if index == 0 else "bluetooth")
+                        else:
+                            self.toggle_mute()
                         event.accept()
                         return
             self.context_menu(event.globalPosition().toPoint())
@@ -593,7 +858,6 @@ class CozyOrbit(QWidget):
         self.pressed_index = -1
 
         if self.distance(pos, CENTER) <= ORB_RADIUS + 10:
-            # Keep the orbit moving while the centre is pressed or dragged.
             # Do not start a compositor move on every centre click. Starting a
             # move immediately can swallow the click/release on Wayland.
             event.accept()
@@ -608,24 +872,27 @@ class CozyOrbit(QWidget):
                     event.accept()
                     return
 
+    def _manual_move(self, current: QPoint):
+        self.move(current - (self.press_global_position - self.press_window_position))
+
     def mouseMoveEvent(self, event):
         if self.press_global_position is None:
+            return
+        if self.distance(self.press_position, CENTER) > ORB_RADIUS + 10:
+            event.accept()
             return
         current = event.globalPosition().toPoint()
         dx = current.x() - self.press_global_position.x()
         dy = current.y() - self.press_global_position.y()
-        if (not self.dragging and math.hypot(dx, dy) >= DRAG_THRESHOLD
-                and self.distance(self.press_position, CENTER) <= ORB_RADIUS + 10):
+        if not self.dragging and math.hypot(dx, dy) >= DRAG_THRESHOLD:
             self.dragging = True
             # Begin a native move only after the pointer has actually moved.
             # This keeps an ordinary click reliable while preserving Wayland drag.
             handle = self.windowHandle()
             if handle is not None:
                 self.move_started = bool(handle.startSystemMove())
-            if not self.move_started and os.environ.get("XDG_SESSION_TYPE") != "wayland":
-                self.move(current - (self.press_global_position - self.press_window_position))
-        elif self.dragging and not self.move_started and os.environ.get("XDG_SESSION_TYPE") != "wayland":
-            self.move(current - (self.press_global_position - self.press_window_position))
+        if self.dragging and not self.move_started and not is_wayland():
+            self._manual_move(current)
         event.accept()
 
     def mouseReleaseEvent(self, event):
@@ -639,8 +906,6 @@ class CozyOrbit(QWidget):
                 self.press_window_position = None
                 self.rotation_paused = False
                 self.dragging = False
-                if not self.frame_timer.isActive():
-                    self.frame_timer.start()
                 if not was_drag:
                     self.toggle_expanded()
                 self.update()
@@ -672,39 +937,32 @@ class CozyOrbit(QWidget):
         self.rotation_paused = False
         self.update()
 
-    # System status
+    # ----- system status (background threads) ------------------------------
+
+    def poll_status(self):
+        # Nothing on screen needs fresh data while the orbit is closed.
+        if self.expanded:
+            self.refresh_status()
+
     def refresh_status(self):
-        self.refresh_wifi()
-        self.refresh_bluetooth()
-        self.refresh_battery()
+        self.refresh_battery()  # a cheap sysfs read, fine on the GUI thread
+        if not self._status_busy:
+            self._status_busy = True
+            threading.Thread(target=self._status_worker, daemon=True).start()
         self.update()
 
-    def refresh_wifi(self):
-        if not has_command("nmcli"):
-            self.wifi = "N/A"
-            return
-        state = get_output(["nmcli", "radio", "wifi"], "unknown").lower()
-        self.wifi = "On" if state == "enabled" else (
-            "Off" if state == "disabled" else "Unknown"
-        )
+    def _status_worker(self):
+        try:
+            data = {"wifi": query_wifi(), "bluetooth": query_bluetooth()}
+        except Exception:
+            data = {}
+        self.status_ready.emit(data)
 
-    def refresh_bluetooth(self):
-        if not has_command("bluetoothctl"):
-            self.bluetooth = "N/A"
-            return
-        result = run_command(["bluetoothctl", "show"])
-        if result is None:
-            self.bluetooth = "Unknown"
-            return
-        output = result.stdout.lower()
-        if "powered: yes" in output:
-            self.bluetooth = "On"
-        elif "powered: no" in output:
-            self.bluetooth = "Off"
-        elif "no default controller" in output:
-            self.bluetooth = "N/A"
-        else:
-            self.bluetooth = "Unknown"
+    def apply_status(self, data: dict):
+        self._status_busy = False
+        self.wifi = data.get("wifi", self.wifi)
+        self.bluetooth = data.get("bluetooth", self.bluetooth)
+        self.update()
 
     def refresh_battery(self):
         for battery in Path("/sys/class/power_supply").glob("BAT*"):
@@ -720,36 +978,55 @@ class CozyOrbit(QWidget):
         self.battery = "N/A"
         self.battery_state = ""
 
+    # ----- actions ---------------------------------------------------------
+
+    def run_job(self, job):
+        """Run `job() -> JobResult` off the GUI thread."""
+        def worker():
+            try:
+                result = job()
+            except Exception as exc:  # never let a worker die silently
+                result = JobResult(False, f"Error: {exc}")
+            self.job_finished.emit(result)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_job_finished(self, result: JobResult):
+        if result.permission_error:
+            self.show_brightness_permission_help()
+            return
+        self.notify(result.message)
+        if result.ok:
+            QTimer.singleShot(700, self.refresh_status)
+
     def execute(self, args, success_message):
-        if not has_command(args[0]):
-            self.notify(f"Missing command: {args[0]}")
-            return False
-        result = run_command(args)
-        if result is None:
-            self.notify("Command execution failed")
-            return False
-        if result.returncode != 0:
-            error = result.stderr.strip() or result.stdout.strip()
-            if args[0] == "brightnessctl" and any(
-                term in error.lower() for term in ("permission denied", "operation not permitted", "access denied")
-            ):
-                self.show_brightness_permission_help()
-            else:
-                self.notify(error.splitlines()[-1][:58] if error else "Operation failed")
-            return False
-        self.notify(success_message)
-        QTimer.singleShot(700, self.refresh_status)
-        return True
+        """Run a command in the background; `success_message` may be a callable."""
+        def job():
+            if not has_command(args[0]):
+                return JobResult(False, f"Missing command: {args[0]}")
+            result = run_command(args)
+            if result is None:
+                return JobResult(False, "Command timed out or failed")
+            if result.returncode != 0:
+                error = result.stderr.strip() or result.stdout.strip()
+                permission = args[0] == "brightnessctl" and any(
+                    term in error.lower()
+                    for term in ("permission denied", "operation not permitted", "access denied")
+                )
+                message = error.splitlines()[-1] if error else "Operation failed"
+                return JobResult(False, message, permission)
+            message = success_message() if callable(success_message) else success_message
+            return JobResult(True, message)
+        self.run_job(job)
 
     def activate(self, index):
         actions = {
             0: self.toggle_wifi,
             1: self.toggle_bluetooth,
-            2: lambda: self.change_volume("-5%"),
-            3: lambda: self.change_volume("+5%"),
+            2: lambda: self.change_volume(-1),
+            3: lambda: self.change_volume(+1),
             4: self.show_battery,
-            5: lambda: self.change_brightness("5%-"),
-            6: lambda: self.change_brightness("5%+"),
+            5: lambda: self.change_brightness(-1),
+            6: lambda: self.change_brightness(+1),
             7: self.open_widget_settings,
         }
         action = actions.get(index)
@@ -770,26 +1047,36 @@ class CozyOrbit(QWidget):
         state = "off" if self.bluetooth == "On" else "on"
         self.execute(["bluetoothctl", "power", state], f"Bluetooth {state.upper()}")
 
-    def change_volume(self, amount):
+    def change_volume(self, direction: int):
+        sign = "+" if direction > 0 else "-"
         if has_command("wpctl"):
-            value = "5%+" if amount == "+5%" else "5%-"
+            # -l 1.0 stops the volume going past 100%.
             self.execute(
-                ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", value],
-                f"Volume {amount}",
+                ["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", f"5%{sign}"],
+                read_volume,
             )
         elif has_command("pactl"):
             self.execute(
-                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", amount],
-                f"Volume {amount}",
+                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{sign}5%"],
+                read_volume,
             )
         else:
             self.notify("Audio control unavailable")
 
-    def change_brightness(self, amount):
+    def toggle_mute(self):
+        if has_command("wpctl"):
+            self.execute(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"], read_volume)
+        elif has_command("pactl"):
+            self.execute(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"], read_volume)
+        else:
+            self.notify("Audio control unavailable")
+
+    def change_brightness(self, direction: int):
         if not has_command("brightnessctl"):
             self.notify("Install brightnessctl")
             return
-        self.execute(["brightnessctl", "set", amount], f"Brightness {amount}")
+        amount = "5%+" if direction > 0 else "5%-"
+        self.execute(["brightnessctl", "set", amount], read_brightness)
 
     def show_brightness_permission_help(self):
         details = (
@@ -817,30 +1104,16 @@ class CozyOrbit(QWidget):
     def open_widget_settings(self):
         dialog = WidgetSettingsDialog(self.settings, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            dialog.save_preferences()
+            autostart_ok = dialog.save_preferences()
             self.apply_preferences()
-            self.notify("Widget settings saved")
-
-    def apply_preferences(self):
-        self.theme_name = self.settings.value("theme", "Pastel Pink", type=str)
-        if self.theme_name not in THEMES:
-            self.theme_name = "Pastel Pink"
-        self.rotation_enabled = self.settings.value(
-            "rotation_enabled", True, type=bool
-        )
-        self.rotation_speed_level = self.settings.value(
-            "rotation_speed_level", 2, type=int
-        )
-        self.rotation_speed = self.speed_from_level(self.rotation_speed_level)
-        self.tinted_icons = self.make_tinted_icons()
-        if not self.frame_timer.isActive():
-            self.frame_timer.start()
-        self.update()
+            self.notify("Widget settings saved" if autostart_ok
+                        else "Saved, but couldn't update autostart")
 
     def showEvent(self, event):
         super().showEvent(event)
-        if not self.frame_timer.isActive():
-            self.frame_timer.start()
+        # Rebuild icons now that the real screen (and its DPI) is known.
+        self.tinted_icons = self.make_tinted_icons()
+        self.update_frame_timer()
         # Kick a first paint/status refresh after the compositor has mapped us.
         QTimer.singleShot(0, self.update)
         QTimer.singleShot(150, self.refresh_status)
@@ -865,7 +1138,7 @@ class CozyOrbit(QWidget):
             self.notify("KDE System Settings not found")
 
     def context_menu(self, point):
-        p = self.palette
+        p = self.theme
         menu = QMenu(self)
         menu.setStyleSheet(f"""
             QMenu {{
@@ -889,6 +1162,10 @@ class CozyOrbit(QWidget):
         bluetooth_settings_action.triggered.connect(lambda: self.open_device_settings("bluetooth"))
         menu.addAction(bluetooth_settings_action)
 
+        mute_action = QAction("Mute / unmute", menu)
+        mute_action.triggered.connect(self.toggle_mute)
+        menu.addAction(mute_action)
+
         refresh_action = QAction("Refresh device status", menu)
         refresh_action.triggered.connect(self.refresh_status)
         menu.addAction(refresh_action)
@@ -905,6 +1182,7 @@ class CozyOrbit(QWidget):
         menu.exec(point)
 
     def closeEvent(self, event):
+        self.save_position()
         self.frame_timer.stop()
         self.status_timer.stop()
         self.notification_timer.stop()
@@ -922,9 +1200,18 @@ def main():
     # must never make QApplication quit. Quit remains available in the menu.
     app.setQuitOnLastWindowClosed(False)
 
+    # Allow only one running copy per user.
+    lock = QLockFile(str(Path(tempfile.gettempdir()) / f"cozy-orbit-{os.getuid()}.lock"))
+    lock.setStaleLockTime(0)  # a lock left by a crashed process is ignored
+    if not lock.tryLock(100):
+        print(f"{APP_NAME} is already running.", file=sys.stderr)
+        return 0
+
     widget = CozyOrbit()
     widget.show()
-    return app.exec()
+    code = app.exec()
+    lock.unlock()
+    return code
 
 
 if __name__ == "__main__":
