@@ -1377,7 +1377,8 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     # Allow only one running copy per user.
-    lock = QLockFile(str(Path(tempfile.gettempdir()) / f"cozy-orbit-{os.getuid()}.lock"))
+    user_id = os.environ.get("USERNAME", "windows-user")
+    lock = QLockFile(str(Path(tempfile.gettempdir()) / f"cozy-orbit-{user_id}.lock"))
     lock.setStaleLockTime(0)  # a lock left by a crashed process is ignored
     if not lock.tryLock(100):
         print(f"{APP_NAME} is already running.", file=sys.stderr)
