@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.9.0
+Cozy Orbit v0.9.2
 A customisable radial desktop control widget for KDE Plasma 6 (Wayland/X11).
 
 Requirements:
@@ -55,11 +55,11 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMenu, QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QSlider, QCheckBox, QDialogButtonBox,
-    QFormLayout, QGroupBox, QMessageBox, QFrame, QPushButton,
+    QFormLayout, QGroupBox, QMessageBox,
 )
 
 APP_NAME = "Cozy Orbit"
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.2"
 ORG_NAME = "CozyOrbit"
 SETTINGS_DOMAIN = "cozy-orbit"
 
@@ -75,17 +75,18 @@ DRAG_THRESHOLD = 8
 # Radians per second for each speed level (level 2 ≈ one revolution / 2 min).
 ROTATION_RAD_PER_SEC_PER_LEVEL = 0.027
 
-LABELS = ["Wi-Fi", "Bluetooth", "Media", "Battery", "Settings"]
+LABELS = ["Wi-Fi", "Bluetooth", "Volume", "Battery", "Brightness", "Settings"]
 # Prefer the active desktop icon theme (Breeze on KDE). Text fallbacks are
 # used only when a theme does not provide one of these standard icon names.
 SYSTEM_ICON_CANDIDATES = [
     ("network-wireless", "network-wireless-connected"),
     ("bluetooth", "bluetooth-active"),
-    ("audio-volume-high", "audio-volume-medium", "display-brightness"),
+    ("audio-volume-high", "audio-volume-medium", "audio-volume-low"),
     ("battery", "battery-full"),
+    ("display-brightness", "preferences-desktop-display"),
     ("preferences-system", "settings-configure"),
 ]
-ICON_FALLBACKS = ["W", "B", "◐", "%", "⚙"]
+ICON_FALLBACKS = ["W", "B", "♪", "%", "☼", "⚙"]
 
 THEMES = {
     "Pastel Pink": {
@@ -238,34 +239,22 @@ def read_volume() -> str:
 
 def read_brightness() -> str:
     out = get_output(["brightnessctl", "-m"])
-    fields = out.split(",")
-    if len(fields) >= 4 and fields[3].endswith("%"):
-        return f"Brightness {fields[3]}"
+    match = re.search(r"(\d+%)", out)
+    if match:
+        return f"Brightness {match.group(1)}"
     return "Brightness changed"
 
 
-def read_volume_level() -> int:
-    if has_command("wpctl"):
-        out = get_output(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"] )
-        match = re.search(r"([\d.]+)", out)
-        if match:
-            return max(0, min(100, round(float(match.group(1)) * 100)))
-    if has_command("pactl"):
-        out = get_output(["pactl", "get-sink-volume", "@DEFAULT_SINK@"] )
-        match = re.search(r"(\d+)%", out)
-        if match:
-            return max(0, min(100, int(match.group(1))))
-    return 0
+def read_volume_percent() -> int:
+    text = read_volume()
+    match = re.search(r"(\d+)%", text)
+    return max(0, min(100, int(match.group(1)))) if match else 50
 
 
-def read_brightness_level() -> int:
-    out = get_output(["brightnessctl", "-m"])
-    fields = out.split(",")
-    if len(fields) >= 4:
-        match = re.search(r"(\d+)%", fields[3])
-        if match:
-            return max(0, min(100, int(match.group(1))))
-    return 0
+def read_brightness_percent() -> int:
+    text = read_brightness()
+    match = re.search(r"(\d+)%", text)
+    return max(0, min(100, int(match.group(1)))) if match else 50
 
 
 def autostart_file() -> Path:
@@ -431,128 +420,6 @@ class WidgetSettingsDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Custom media popover (kept beside Cozy Orbit; never opens a system OSD)
-# ---------------------------------------------------------------------------
-
-class MediaPopup(QFrame):
-    """A small, theme-matched volume/brightness slider anchored to the orbit."""
-
-    def __init__(self, orbit):
-        super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
-                         | Qt.WindowType.WindowStaysOnTopHint)
-        self.orbit = orbit
-        self.kind = "volume"
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
-        self.setObjectName("MediaPopup")
-        root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(9)
-        top = QHBoxLayout()
-        self.volume_button = QPushButton("Volume")
-        self.brightness_button = QPushButton("Brightness")
-        self.volume_button.clicked.connect(lambda: self.set_kind("volume"))
-        self.brightness_button.clicked.connect(lambda: self.set_kind("brightness"))
-        top.addWidget(self.volume_button)
-        top.addWidget(self.brightness_button)
-        root.addLayout(top)
-        value_row = QHBoxLayout()
-        self.title = QLabel("Volume")
-        self.percent = QLabel("0%")
-        self.percent.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        value_row.addWidget(self.title)
-        value_row.addStretch(1)
-        value_row.addWidget(self.percent)
-        root.addLayout(value_row)
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(0, 100)
-        self.slider.valueChanged.connect(self.value_changed)
-        root.addWidget(self.slider)
-        self.setFixedWidth(250)
-        self.setStyleSheet("""
-            QFrame#MediaPopup { background: #FFF5FA; border: 1px solid #F7B8D0; border-radius: 13px; }
-            QLabel { color: #594563; font-size: 10pt; }
-            QPushButton { color: #594563; background: #F3E5F2; border: 0; border-radius: 8px; padding: 7px 10px; }
-            QPushButton:checked, QPushButton:hover { background: #E8D9F5; }
-            QSlider::groove:horizontal { height: 6px; background: #E4D4EA; border-radius: 3px; }
-            QSlider::sub-page:horizontal { background: #C69BCF; border-radius: 3px; }
-            QSlider::handle:horizontal { width: 15px; margin: -5px 0; border-radius: 7px; background: #916A9E; }
-        """)
-        self.volume_button.setCheckable(True)
-        self.brightness_button.setCheckable(True)
-        self._updating = False
-        self._pending_value = None
-        self._write_timer = QTimer(self)
-        self._write_timer.setSingleShot(True)
-        self._write_timer.setInterval(85)
-        self._write_timer.timeout.connect(self._commit_value)
-        self._apply_theme()
-
-    def _apply_theme(self):
-        p = self.orbit.theme
-        self.setStyleSheet(f"""
-            QFrame#MediaPopup {{ background: {p['menu_bg']}; border: 1px solid {p['accent']}; border-radius: 13px; }}
-            QLabel {{ color: {p['menu_text']}; font-size: 10pt; }}
-            QPushButton {{ color: {p['menu_text']}; background: {p['menu_selected']}; border: 0; border-radius: 8px; padding: 7px 10px; }}
-            QPushButton:checked, QPushButton:hover {{ background: {p['accent']}; }}
-            QSlider::groove:horizontal {{ height: 6px; background: {p['menu_selected']}; border-radius: 3px; }}
-            QSlider::sub-page:horizontal {{ background: {p['accent']}; border-radius: 3px; }}
-            QSlider::handle:horizontal {{ width: 15px; margin: -5px 0; border-radius: 7px; background: {p['center_icon']}; }}
-        """)
-
-    def set_kind(self, kind):
-        self.kind = kind
-        self._updating = True
-        if kind == "volume":
-            value = read_volume_level()
-            self.title.setText("Volume")
-            self.volume_button.setChecked(True)
-            self.brightness_button.setChecked(False)
-        else:
-            value = read_brightness_level()
-            self.title.setText("Brightness")
-            self.volume_button.setChecked(False)
-            self.brightness_button.setChecked(True)
-        self.slider.setValue(value)
-        self.percent.setText(f"{value}%")
-        self._updating = False
-        self.orbit.volume_level = read_volume_level()
-        self.orbit.brightness_level = read_brightness_level()
-        self.orbit.update()
-
-    def value_changed(self, value):
-        self.percent.setText(f"{value}%")
-        if self._updating:
-            return
-        self._pending_value = value
-        self._write_timer.start()
-
-    def _commit_value(self):
-        if self._pending_value is not None:
-            value = self._pending_value
-            self._pending_value = None
-            self.orbit.set_media_level(self.kind, value)
-
-    def show_for_orbit(self, kind="volume"):
-        self._apply_theme()
-        self.set_kind(kind)
-        self.adjustSize()
-        orbit_rect = self.orbit.frameGeometry()
-        screen = QGuiApplication.screenAt(orbit_rect.center()) or QGuiApplication.primaryScreen()
-        area = screen.availableGeometry()
-        x = orbit_rect.right() + 10
-        if x + self.width() > area.right():
-            x = orbit_rect.left() - self.width() - 10
-        y = orbit_rect.top() + (orbit_rect.height() - self.height()) // 2
-        y = max(area.top() + 8, min(y, area.bottom() - self.height() - 8))
-        x = max(area.left() + 8, min(x, area.right() - self.width() - 8))
-        self.move(x, y)
-        self.show()
-        self.raise_()
-        self.activateWindow()
-        self.slider.setFocus(Qt.FocusReason.OtherFocusReason)
-
-
-# ---------------------------------------------------------------------------
 # Main widget
 # ---------------------------------------------------------------------------
 
@@ -574,7 +441,7 @@ class CozyOrbit(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setFixedSize(SIZE, SIZE)
-        self.setMouseTracking(False)
+        self.setMouseTracking(True)
         # Resolve icons from the desktop's active icon theme (normally KDE Breeze).
         self.system_icons = [desktop_icon(names) for names in SYSTEM_ICON_CANDIDATES]
 
@@ -595,6 +462,16 @@ class CozyOrbit(QWidget):
         self.expanded = False
         self.rotation_paused = False
         self.pressed_index = -1
+        self.hovered_index = -1
+        self.radial_control = None
+        self.radial_value = 0
+        self.radial_dragging = False
+        self.radial_command_timer = QTimer(self)
+        self.radial_command_timer.setSingleShot(True)
+        self.radial_command_timer.setInterval(65)
+        self.radial_command_timer.timeout.connect(self.apply_radial_value)
+        self.volume_percent = 50
+        self.brightness_percent = 50
         self.press_position = QPointF()
         self.press_global_position = None
         self.press_window_position = None
@@ -602,10 +479,6 @@ class CozyOrbit(QWidget):
         self.move_started = False
         self._last_frame = time.monotonic()
         self._status_busy = False
-        self.media_sector_open = False
-        self.volume_level = read_volume_level()
-        self.brightness_level = read_brightness_level()
-        self.media_popup = MediaPopup(self)
 
         self.rotation_resume_timer = QTimer(self)
         self.rotation_resume_timer.setSingleShot(True)
@@ -788,8 +661,8 @@ class CozyOrbit(QWidget):
 
     def get_positions(self):
         points = []
-        for i in range(5):
-            angle = -math.pi / 2 + i * (2 * math.pi / 5) + self.rotation
+        for i in range(6):
+            angle = -math.pi / 2 + i * (math.pi / 3) + self.rotation
             radius = ORBIT_RADIUS * self._progress
             points.append(QPointF(
                 CENTER.x() + math.cos(angle) * radius,
@@ -811,10 +684,8 @@ class CozyOrbit(QWidget):
         self.draw_background(painter)
         if self._progress > 0.001:
             self.draw_flower(painter)
-            if self.media_sector_open:
-                self.draw_media_sector(painter)
-            else:
-                self.draw_controls(painter)
+            self.draw_controls(painter)
+            self.draw_radial_slider(painter)
         self.draw_center(painter)
         self.draw_notification(painter)
         painter.end()
@@ -838,8 +709,8 @@ class CozyOrbit(QWidget):
 
     def draw_flower(self, painter):
         p = self.theme
-        for i in range(8):
-            angle = -90 + i * 45 + math.degrees(self.rotation)
+        for i in range(6):
+            angle = -90 + i * 60 + math.degrees(self.rotation)
             painter.save()
             painter.translate(CENTER)
             painter.rotate(angle)
@@ -881,65 +752,99 @@ class CozyOrbit(QWidget):
             icon_rect = QRectF(pos.x() - ICON_SIZE / 2, pos.y() - ICON_SIZE / 2,
                                ICON_SIZE, ICON_SIZE)
             if not icon.isNull():
-                painter.drawPixmap(icon_rect.toRect(), icon)
+                # Keep fractional coordinates so the icon does not shimmer while orbiting.
+                painter.drawPixmap(icon_rect, icon, QRectF(icon.rect()))
             else:
                 painter.setPen(QColor(p["text"]))
                 painter.setFont(QFont("DejaVu Sans", 14, QFont.Weight.Bold))
-                painter.drawText(
-                    QRectF(pos.x() - 17, pos.y() - 17, 34, 34),
-                    Qt.AlignmentFlag.AlignCenter, ICON_FALLBACKS[i],
-                )
+                painter.drawText(QRectF(pos.x() - 17, pos.y() - 17, 34, 34),
+                                 Qt.AlignmentFlag.AlignCenter, ICON_FALLBACKS[i])
 
-            if self._progress > 0.90:
-                painter.setFont(QFont("DejaVu Sans", 6 if i == 2 else 7, QFont.Weight.DemiBold))
-                painter.setPen(QColor(p["text"]))
-                label_width = 126 if i == 2 else 84
-                painter.drawText(
-                    QRectF(pos.x() - label_width / 2, pos.y() + 31, label_width, 18),
-                    Qt.AlignmentFlag.AlignCenter, self.get_label(i),
-                )
+            # Labels are transient: hover reveals a state/value, not a permanent name.
+            if self._progress > 0.90 and self.hovered_index == i:
+                label = self.get_hover_state(i)
+                painter.setOpacity(1.0)
+                painter.setFont(QFont("DejaVu Sans", 8, QFont.Weight.Bold))
+                metrics_rect = QRectF(pos.x() - 48, pos.y() + 31, 96, 19)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(p["menu_bg"]))
+                painter.drawRoundedRect(metrics_rect, 8, 8)
+                painter.setPen(QColor(p["menu_text"]))
+                painter.drawText(metrics_rect, Qt.AlignmentFlag.AlignCenter, label)
             painter.restore()
 
-    def get_label(self, index):
+    def get_hover_state(self, index):
         if index == 0:
-            return f"Wi-Fi {self.wifi}"
+            return self.wifi.upper()
         if index == 1:
-            return f"BT {self.bluetooth}"
+            return self.bluetooth.upper()
         if index == 2:
-            return f"Vol {self.volume_level}% · Bright {self.brightness_level}%"
+            return f"{self.volume_percent}%"
         if index == 3:
-            return self.battery + (" ⚡" if self.battery_state == "Charging" else "")
-        return "Settings"
+            state = " ⚡" if self.battery_state == "Charging" else ""
+            return f"{self.battery}{state}"
+        if index == 4:
+            return f"{self.brightness_percent}%"
+        return "SETTINGS"
 
-    def draw_media_sector(self, painter):
-        """Two large selectable semicircle sectors fill the orbit's flower area."""
+    def draw_radial_slider(self, painter):
+        if self.radial_control not in ("volume", "brightness") or self._progress < 0.90:
+            return
         p = self.theme
-        radius = 163 * self._progress
-        rect = QRectF(CENTER.x() - radius, CENTER.y() - radius, radius * 2, radius * 2)
+        radius = 178.0
+        rect = QRectF(CENTER.x() - radius, CENTER.y() - radius,
+                      radius * 2, radius * 2)
         painter.save()
-        painter.setPen(QPen(QColor(p["outline"]), 1.8))
-        # Left half: Volume. Right half: Brightness.
-        painter.setBrush(QColor(p["petal_a"]))
-        painter.drawPie(rect, 90 * 16, 180 * 16)
-        painter.setBrush(QColor(p["petal_b"]))
-        painter.drawPie(rect, -90 * 16, 180 * 16)
-        painter.setPen(QPen(QColor(p["text"]), 1.2))
-        painter.drawLine(QPointF(CENTER.x(), CENTER.y() - radius),
-                         QPointF(CENTER.x(), CENTER.y() + radius))
-        painter.setFont(QFont("DejaVu Sans", 13, QFont.Weight.DemiBold))
-        painter.drawText(QRectF(CENTER.x() - radius + 12, CENTER.y() - 24, radius - 24, 34),
-                         Qt.AlignmentFlag.AlignCenter, "Volume")
-        painter.drawText(QRectF(CENTER.x() + 12, CENTER.y() - 24, radius - 24, 34),
-                         Qt.AlignmentFlag.AlignCenter, "Brightness")
-        painter.setFont(QFont("DejaVu Sans", 17, QFont.Weight.Bold))
-        painter.drawText(QRectF(CENTER.x() - radius + 12, CENTER.y() + 8, radius - 24, 32),
-                         Qt.AlignmentFlag.AlignCenter, f"{self.volume_level}%")
-        painter.drawText(QRectF(CENTER.x() + 12, CENTER.y() + 8, radius - 24, 32),
-                         Qt.AlignmentFlag.AlignCenter, f"{self.brightness_level}%")
-        painter.setFont(QFont("DejaVu Sans", 8))
-        painter.drawText(QRectF(CENTER.x() - 60, CENTER.y() + radius - 28, 120, 18),
-                         Qt.AlignmentFlag.AlignCenter, "Click a side · Esc to close")
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Soft external circular halo, clearly outside the original flower.
+        halo = QColor(p["outline"])
+        halo.setAlpha(190)
+        painter.setPen(QPen(halo, 1.5))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(rect)
+        track = QColor(p["text"])
+        track.setAlpha(55)
+        painter.setPen(QPen(track, 9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        path = self.radial_arc_path(0, 100, radius)
+        painter.drawPath(path)
+        accent = QColor(p["accent"])
+        painter.setPen(QPen(accent, 9, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawPath(self.radial_arc_path(0, self.radial_value, radius))
+        knob = self.radial_point(self.radial_value, radius)
+        painter.setPen(QPen(QColor(p["outline"]), 2))
+        painter.setBrush(QColor(p["center_end"]))
+        painter.drawEllipse(knob, 10, 10)
+        # Compact title/value badge at the top of the outer ring.
+        badge = QRectF(CENTER.x() - 65, 18, 130, 30)
+        painter.setPen(QPen(QColor(p["outline"]), 1))
+        painter.setBrush(QColor(p["menu_bg"]))
+        painter.drawRoundedRect(badge, 13, 13)
+        painter.setPen(QColor(p["menu_text"]))
+        painter.setFont(QFont("DejaVu Sans", 9, QFont.Weight.Bold))
+        name = "VOLUME" if self.radial_control == "volume" else "BRIGHTNESS"
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter,
+                         f"{name}  {self.radial_value}%")
         painter.restore()
+
+    @staticmethod
+    def radial_point(value, radius=178.0):
+        angle = math.radians(135.0 - 270.0 * max(0, min(100, value)) / 100.0)
+        return QPointF(CENTER.x() + math.cos(angle) * radius,
+                       CENTER.y() + math.sin(angle) * radius)
+
+    @staticmethod
+    def radial_arc_path(start_value, end_value, radius=178.0):
+        from PySide6.QtGui import QPainterPath
+        path = QPainterPath()
+        steps = max(2, int(abs(end_value - start_value) * 1.5))
+        for n in range(steps + 1):
+            value = start_value + (end_value - start_value) * n / steps
+            point = CozyOrbit.radial_point(value, radius)
+            if n == 0:
+                path.moveTo(point)
+            else:
+                path.lineTo(point)
+        return path
 
     def draw_center(self, painter):
         p = self.theme
@@ -1001,11 +906,12 @@ class CozyOrbit(QWidget):
         self.update()
 
     # ----- mouse / keyboard ------------------------------------------------
-    # No hover expansion or hover highlighting.
+    # Hover labels reveal live state without cluttering the resting orbit.
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape and self.media_sector_open:
-            self.media_sector_open = False
+        if event.key() == Qt.Key.Key_Escape and self.radial_control:
+            self.radial_control = None
+            self.rotation_paused = False
             self.update()
             event.accept()
             return
@@ -1020,10 +926,10 @@ class CozyOrbit(QWidget):
             pos = QPointF(event.position())
             if self._progress > 0.90:
                 for index, point in enumerate(self.get_positions()):
-                    if self.distance(pos, point) <= BUTTON_RADIUS + 12 and index < 3:
+                    if self.distance(pos, point) <= BUTTON_RADIUS + 12:
                         if index < 2:
                             self.open_device_settings("wifi" if index == 0 else "bluetooth")
-                        else:
+                        elif index == 2:
                             self.toggle_mute()
                         event.accept()
                         return
@@ -1033,16 +939,33 @@ class CozyOrbit(QWidget):
             return
 
         pos = QPointF(event.position())
+        if self.radial_control:
+            radius_from_center = self.distance(pos, CENTER)
+            if abs(radius_from_center - 178.0) <= 24:
+                self.radial_dragging = True
+                self.set_radial_from_position(pos)
+                event.accept()
+                return
+            # Clicking a different control switches the outer ring's function.
+            if self._progress > 0.90:
+                for i, point in enumerate(self.get_positions()):
+                    if self.distance(pos, point) <= BUTTON_RADIUS + 12:
+                        if i in (2, 4):
+                            self.activate(i)
+                            event.accept()
+                            return
+            if radius_from_center < ORB_RADIUS + 10:
+                self.radial_control = None
+                self.rotation_paused = False
+                self.update()
+                event.accept()
+                return
         self.press_position = pos
         self.press_global_position = event.globalPosition().toPoint()
         self.press_window_position = self.pos()
         self.dragging = False
         self.move_started = False
         self.pressed_index = -1
-
-        if self.media_sector_open:
-            event.accept()
-            return
 
         if self.distance(pos, CENTER) <= ORB_RADIUS + 10:
             # Do not start a compositor move on every centre click. Starting a
@@ -1063,6 +986,20 @@ class CozyOrbit(QWidget):
         self.move(current - (self.press_global_position - self.press_window_position))
 
     def mouseMoveEvent(self, event):
+        pos = QPointF(event.position())
+        if self.radial_dragging:
+            self.set_radial_from_position(pos)
+            event.accept()
+            return
+        new_hover = -1
+        if self._progress > 0.90 and not self.radial_control:
+            for i, point in enumerate(self.get_positions()):
+                if self.distance(pos, point) <= BUTTON_RADIUS + 10:
+                    new_hover = i
+                    break
+        if new_hover != self.hovered_index:
+            self.hovered_index = new_hover
+            self.update()
         if self.press_global_position is None:
             return
         if self.distance(self.press_position, CENTER) > ORB_RADIUS + 10:
@@ -1085,20 +1022,11 @@ class CozyOrbit(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton:
             return
-
-        if self.media_sector_open and self.press_global_position is not None:
-            local = QPointF(event.position())
-            radius = 163 * self._progress
-            if self.distance(local, CENTER) <= radius and self.distance(local, CENTER) > 34:
-                if local.x() < CENTER.x():
-                    self.media_popup.show_for_orbit("volume")
-                else:
-                    self.media_popup.show_for_orbit("brightness")
-            self.media_sector_open = False
-            self.press_global_position = None
-            self.press_window_position = None
-            self.rotation_paused = False
-            self.update()
+        if self.radial_dragging:
+            self.radial_dragging = False
+            self.radial_command_timer.stop()
+            self.apply_radial_value()
+            QTimer.singleShot(350, self.refresh_status)
             event.accept()
             return
 
@@ -1124,10 +1052,7 @@ class CozyOrbit(QWidget):
                 self.activate(index)
                 # Hold the orbit still briefly so the selected control is easy
                 # to follow while Wi-Fi/Bluetooth or another action responds.
-                if index == 2:
-                    self.rotation_paused = True
-                else:
-                    self.rotation_resume_timer.start(900)
+                self.rotation_resume_timer.start(900)
             else:
                 self.rotation_paused = False
             self.update()
@@ -1159,7 +1084,11 @@ class CozyOrbit(QWidget):
 
     def _status_worker(self):
         try:
-            data = {"wifi": query_wifi(), "bluetooth": query_bluetooth()}
+            data = {
+                "wifi": query_wifi(), "bluetooth": query_bluetooth(),
+                "volume": read_volume_percent(),
+                "brightness": read_brightness_percent(),
+            }
         except Exception:
             data = {}
         self.status_ready.emit(data)
@@ -1168,6 +1097,12 @@ class CozyOrbit(QWidget):
         self._status_busy = False
         self.wifi = data.get("wifi", self.wifi)
         self.bluetooth = data.get("bluetooth", self.bluetooth)
+        self.volume_percent = data.get("volume", self.volume_percent)
+        self.brightness_percent = data.get("brightness", self.brightness_percent)
+        if self.radial_control == "volume":
+            self.radial_value = self.volume_percent
+        elif self.radial_control == "brightness":
+            self.radial_value = self.brightness_percent
         self.update()
 
     def refresh_battery(self):
@@ -1200,8 +1135,7 @@ class CozyOrbit(QWidget):
         if result.permission_error:
             self.show_brightness_permission_help()
             return
-        if result.message:
-            self.notify(result.message)
+        self.notify(result.message)
         if result.ok:
             QTimer.singleShot(700, self.refresh_status)
 
@@ -1226,54 +1160,54 @@ class CozyOrbit(QWidget):
         self.run_job(job)
 
     def activate(self, index):
-        actions = {
-            0: self.toggle_wifi,
-            1: self.toggle_bluetooth,
-            2: self.open_media_sector,
-            3: self.show_battery,
-            4: self.open_widget_settings,
-        }
-        action = actions.get(index)
-        if action:
-            action()
+        if index == 0:
+            self.toggle_wifi()
+        elif index == 1:
+            self.toggle_bluetooth()
+        elif index == 2:
+            self.open_radial_control("volume")
+        elif index == 3:
+            self.show_battery()
+        elif index == 4:
+            self.open_radial_control("brightness")
+        elif index == 5:
+            self.open_widget_settings()
 
-    def open_media_sector(self):
-        self.volume_level = read_volume_level()
-        self.brightness_level = read_brightness_level()
-        self.media_sector_open = True
-        self.rotation_paused = True
+    def open_radial_control(self, control):
+        self.radial_control = None if self.radial_control == control else control
+        if self.radial_control == "volume":
+            self.radial_value = self.volume_percent
+        elif self.radial_control == "brightness":
+            self.radial_value = self.brightness_percent
+        self.rotation_paused = self.radial_control is not None
         self.update()
 
-    def set_media_level(self, kind: str, value: int):
-        value = max(0, min(100, int(value)))
-        if kind == "volume":
-            self.volume_level = value
+    def set_radial_from_position(self, pos):
+        dx, dy = pos.x() - CENTER.x(), pos.y() - CENTER.y()
+        angle = math.degrees(math.atan2(dy, dx))
+        progress = (135.0 - angle) % 360.0
+        if progress > 270.0:
+            progress = 0.0 if progress > 315.0 else 100.0
+        self.radial_value = max(0, min(100, round(progress / 270.0 * 100)))
+        self.radial_command_timer.start()
+        self.update()
+
+    def apply_radial_value(self):
+        value = max(0, min(100, int(self.radial_value)))
+        if self.radial_control == "volume":
             if has_command("wpctl"):
-                command = ["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", f"{value / 100:.2f}"]
+                subprocess.Popen(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{value}%"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             elif has_command("pactl"):
-                command = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"]
-            else:
-                self.notify("Audio control unavailable")
-                return
-        else:
-            self.brightness_level = value
-            if not has_command("brightnessctl"):
-                self.notify("Install brightnessctl")
-                return
-            command = ["brightnessctl", "set", f"{value}%"]
-        # Run each adjustment off the UI thread; the popup remains responsive.
-        self.run_job(lambda: self._run_media_command(command, kind, value))
+                subprocess.Popen(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.volume_percent = value
+        elif self.radial_control == "brightness":
+            if has_command("brightnessctl"):
+                subprocess.Popen(["brightnessctl", "set", f"{value}%"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.brightness_percent = value
         self.update()
-
-    def _run_media_command(self, command, kind, value):
-        result = run_command(command)
-        if result is None or result.returncode != 0:
-            error = (result.stderr.strip() if result else "Command timed out") or "Operation failed"
-            permission = kind == "brightness" and any(
-                term in error.lower() for term in ("permission denied", "operation not permitted", "access denied")
-            )
-            return JobResult(False, error.splitlines()[-1], permission)
-        return JobResult(True, "")
 
     def toggle_wifi(self):
         if self.wifi not in ("On", "Off"):
@@ -1428,7 +1362,6 @@ class CozyOrbit(QWidget):
         self.frame_timer.stop()
         self.status_timer.stop()
         self.notification_timer.stop()
-        self.media_popup.close()
         self.animation.stop()
         event.accept()
 
