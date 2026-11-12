@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.9.1
+Cozy Orbit v0.9.2
 A customisable radial desktop control widget for KDE Plasma 6 (Wayland/X11).
 
 Requirements:
@@ -16,10 +16,10 @@ Run:
 
 User preferences are stored using QSettings.
 
-What's new in 0.9.1:
-    * Individual controls can be repositioned using their hover-arc handles.
+What's new in 0.9.2:
+    * Volume and brightness reveal an external curved slider on hover.
+    * Drag the slider knob along its arc to set the level directly.
     * Fractional pixmap drawing reduces icon jitter during orbit rotation.
-    * Subtle hover feedback keeps the controls compact.
 
 What's new in 0.9.0:
     * System commands run in background threads, so the widget never freezes
@@ -64,7 +64,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Cozy Orbit"
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.2"
 ORG_NAME = "CozyOrbit"
 SETTINGS_DOMAIN = "cozy-orbit"
 
@@ -250,8 +250,8 @@ def read_volume() -> str:
 def read_brightness() -> str:
     out = get_output(["brightnessctl", "-m"])
     fields = out.split(",")
-    if len(fields) >= 4 and fields[3].endswith("%"):
-        return f"Brightness {fields[3]}"
+    if len(fields) >= 5 and fields[4].endswith("%"):
+        return f"Brightness {fields[4]}"
     return "Brightness changed"
 
 
@@ -457,16 +457,12 @@ class CozyOrbit(QWidget):
 
         self._progress = 0.0
         self.rotation = 0.0
-        saved_offsets = self.settings.value("control_offsets", [])
-        try:
-            self.control_offsets = [
-                float(saved_offsets[i]) if i < len(saved_offsets) else 0.0
-                for i in range(8)
-            ]
-        except (TypeError, ValueError, IndexError):
-            self.control_offsets = [0.0] * 8
         self.hovered_index = -1
-        self.dragging_control = False
+        # Volume and brightness use an external curved slider, not a movable
+        # icon handle. The slider only appears while hovering those controls.
+        self.slider_kind = None
+        self.slider_value = 50
+        self.slider_dragging = False
         self.expanded = False
         self.rotation_paused = False
         self.pressed_index = -1
@@ -481,6 +477,11 @@ class CozyOrbit(QWidget):
         self.rotation_resume_timer = QTimer(self)
         self.rotation_resume_timer.setSingleShot(True)
         self.rotation_resume_timer.timeout.connect(self.resume_rotation)
+
+        self.slider_apply_timer = QTimer(self)
+        self.slider_apply_timer.setSingleShot(True)
+        self.slider_apply_timer.setInterval(180)
+        self.slider_apply_timer.timeout.connect(self.apply_active_slider_value)
 
         self.position_timer = QTimer(self)
         self.position_timer.setSingleShot(True)
@@ -660,10 +661,7 @@ class CozyOrbit(QWidget):
     def get_positions(self):
         points = []
         for i in range(8):
-            angle = (
-                -math.pi / 2 + i * (math.pi / 4)
-                + self.rotation + self.control_offsets[i]
-            )
+            angle = -math.pi / 2 + i * (math.pi / 4) + self.rotation
             radius = ORBIT_RADIUS * self._progress
             points.append(QPointF(
                 CENTER.x() + math.cos(angle) * radius,
@@ -671,18 +669,81 @@ class CozyOrbit(QWidget):
             ))
         return points
 
-    def get_handle_positions(self):
-        """Small drag handles sit just outside each control's hover arc."""
-        handles = []
-        for point in self.get_positions():
-            dx, dy = point.x() - CENTER.x(), point.y() - CENTER.y()
-            length = max(1.0, math.hypot(dx, dy))
-            offset = BUTTON_RADIUS + 11
-            handles.append(QPointF(
-                point.x() + dx / length * offset,
-                point.y() + dy / length * offset,
-            ))
-        return handles
+    def slider_anchor(self, kind=None):
+        """Anchor the curved slider to the hovered volume/brightness button."""
+        if kind is None:
+            kind = self.slider_kind
+        indices = {"volume": (2, 3), "brightness": (5, 6)}
+        if kind not in indices:
+            return None
+        # Use whichever of the paired buttons is currently hovered. This keeps
+        # the slider close to the pointer while preserving one shared level.
+        index = self.hovered_index if self.hovered_index in indices[kind] else indices[kind][0]
+        return self.get_positions()[index]
+
+    @staticmethod
+    def slider_point(anchor: QPointF, value: float, radius=43.0):
+        # A 270-degree C-shaped track, open toward the widget centre.
+        angle = math.radians(135.0 + 270.0 * max(0.0, min(100.0, value)) / 100.0)
+        return QPointF(anchor.x() + math.cos(angle) * radius,
+                       anchor.y() + math.sin(angle) * radius)
+
+    @staticmethod
+    def slider_value_at(anchor: QPointF, pos: QPointF):
+        angle = math.degrees(math.atan2(pos.y() - anchor.y(), pos.x() - anchor.x()))
+        if angle < 135.0:
+            angle += 360.0
+        return max(0, min(100, round((angle - 135.0) / 270.0 * 100.0)))
+
+    def slider_hit(self, pos: QPointF, kind=None):
+        anchor = self.slider_anchor(kind)
+        if anchor is None:
+            return False
+        radius = self.distance(pos, anchor)
+        if not 32 <= radius <= 55:
+            return False
+        angle = math.degrees(math.atan2(pos.y() - anchor.y(), pos.x() - anchor.x()))
+        if angle < 135.0:
+            angle += 360.0
+        return 135.0 <= angle <= 405.0
+
+    def read_slider_value(self, kind):
+        if kind == "volume":
+            out = get_output(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
+            match = re.search(r"([\d.]+)", out)
+            if match:
+                return max(0, min(100, round(float(match.group(1)) * 100)))
+            out = get_output(["pactl", "get-sink-volume", "@DEFAULT_SINK@"])
+            match = re.search(r"(\d+)%", out)
+            if match:
+                return max(0, min(100, int(match.group(1))))
+        elif kind == "brightness":
+            out = get_output(["brightnessctl", "-m"])
+            fields = out.split(",")
+            if len(fields) >= 5:
+                match = re.search(r"(\d+)%", fields[4])
+                if match:
+                    return max(0, min(100, int(match.group(1))))
+        return 50
+
+    def apply_active_slider_value(self):
+        if self.slider_kind and self.slider_dragging:
+            self.apply_slider_value(self.slider_kind, self.slider_value)
+
+    def apply_slider_value(self, kind, value):
+        value = max(0, min(100, int(value)))
+        if kind == "volume":
+            if has_command("wpctl"):
+                self.execute(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{value}%"], read_volume)
+            elif has_command("pactl"):
+                self.execute(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{value}%"], read_volume)
+            else:
+                self.notify("Audio control unavailable")
+        elif kind == "brightness":
+            if has_command("brightnessctl"):
+                self.execute(["brightnessctl", "set", f"{value}%"], read_brightness)
+            else:
+                self.notify("Install brightnessctl")
 
     @staticmethod
     def distance(a: QPointF, b: QPointF) -> float:
@@ -776,28 +837,6 @@ class CozyOrbit(QWidget):
                     Qt.AlignmentFlag.AlignCenter, ICON_FALLBACKS[i],
                 )
 
-            if self._progress > 0.90 and i == self.hovered_index:
-                # A light, separate arc with a tiny grab point; the control
-                # itself never grows or pops out of the orbit.
-                arc_rect = QRectF(
-                    pos.x() - BUTTON_RADIUS - 8,
-                    pos.y() - BUTTON_RADIUS - 8,
-                    (BUTTON_RADIUS + 8) * 2,
-                    (BUTTON_RADIUS + 8) * 2,
-                )
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.setPen(QPen(QColor(p["accent"]), 2.4,
-                                    Qt.PenStyle.SolidLine,
-                                    Qt.PenCapStyle.RoundCap))
-                painter.drawArc(arc_rect, 25 * 16, 290 * 16)
-                handle = self.get_handle_positions()[i]
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor(p["accent"]))
-                painter.drawEllipse(handle, 4.2, 4.2)
-                painter.setPen(QPen(QColor(p["outline"]), 1.0))
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawEllipse(handle, 4.2, 4.2)
-
             if self._progress > 0.90:
                 painter.setFont(QFont("DejaVu Sans", 7, QFont.Weight.DemiBold))
                 painter.setPen(QColor(p["text"]))
@@ -806,6 +845,33 @@ class CozyOrbit(QWidget):
                     Qt.AlignmentFlag.AlignCenter, self.get_label(i),
                 )
             painter.restore()
+
+        # External curved slider: only volume and brightness have one. It is
+        # drawn outside the icon button, like a normal slider bent around it.
+        if self._progress > 0.90 and self.slider_kind:
+            anchor = self.slider_anchor()
+            if anchor is not None:
+                radius = 43.0
+                rect = QRectF(anchor.x() - radius, anchor.y() - radius,
+                              radius * 2, radius * 2)
+                painter.save()
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(QPen(QColor(p["outline"]).darker(108), 7.0,
+                                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.drawArc(rect, -135 * 16, -270 * 16)
+                painter.setPen(QPen(QColor(p["accent"]), 5.0,
+                                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.drawArc(rect, -135 * 16, -int(270 * self.slider_value / 100) * 16)
+                knob = self.slider_point(anchor, self.slider_value, radius)
+                painter.setPen(QPen(QColor(p["outline"]), 1.5))
+                painter.setBrush(QColor(p["accent"]))
+                painter.drawEllipse(knob, 6.5, 6.5)
+                painter.setPen(QColor(p["text"]))
+                painter.setFont(QFont("DejaVu Sans", 7, QFont.Weight.DemiBold))
+                caption = "VOLUME" if self.slider_kind == "volume" else "BRIGHTNESS"
+                painter.drawText(QRectF(anchor.x() - 34, anchor.y() - 8, 68, 16),
+                                 Qt.AlignmentFlag.AlignCenter, f"{caption} {self.slider_value}%")
+                painter.restore()
 
     def get_label(self, index):
         compact = ["Wi-Fi", "Bluetooth", "Vol −", "Vol +", "Battery",
@@ -878,7 +944,6 @@ class CozyOrbit(QWidget):
         self.update()
 
     # ----- mouse / keyboard ------------------------------------------------
-    # No hover expansion or hover highlighting.
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape and self.expanded:
@@ -910,7 +975,6 @@ class CozyOrbit(QWidget):
         self.press_window_position = self.pos()
         self.dragging = False
         self.move_started = False
-        self.dragging_control = False
         self.pressed_index = -1
 
         if self.distance(pos, CENTER) <= ORB_RADIUS + 10:
@@ -918,16 +982,16 @@ class CozyOrbit(QWidget):
             return
 
         if self._progress > 0.90:
-            # The small outer handle is the drag target. Dragging it moves only
-            # that control around the orbit, not the whole widget or control set.
-            for i, handle in enumerate(self.get_handle_positions()):
-                if self.distance(pos, handle) <= 10:
-                    self.pressed_index = i
-                    self.dragging_control = True
-                    self.rotation_paused = True
-                    self.rotation_resume_timer.stop()
-                    event.accept()
-                    return
+            # Start dragging the curved slider when its track is clicked.
+            if self.slider_kind and self.slider_hit(pos):
+                self.slider_dragging = True
+                self.rotation_paused = True
+                self.rotation_resume_timer.stop()
+                anchor = self.slider_anchor()
+                self.slider_value = self.slider_value_at(anchor, pos)
+                self.update()
+                event.accept()
+                return
 
             for i, point in enumerate(self.get_positions()):
                 if self.distance(pos, point) <= BUTTON_RADIUS + 12:
@@ -943,6 +1007,15 @@ class CozyOrbit(QWidget):
     def mouseMoveEvent(self, event):
         pos = QPointF(event.position())
 
+        if self.slider_dragging:
+            anchor = self.slider_anchor()
+            if anchor is not None:
+                self.slider_value = self.slider_value_at(anchor, pos)
+                self.slider_apply_timer.start()
+                self.update()
+            event.accept()
+            return
+
         if self.press_global_position is None:
             new_hover = -1
             if self._progress > 0.90:
@@ -950,25 +1023,16 @@ class CozyOrbit(QWidget):
                     if self.distance(pos, point) <= BUTTON_RADIUS + 12:
                         new_hover = i
                         break
-                    if self.distance(pos, self.get_handle_positions()[i]) <= 10:
-                        new_hover = i
-                        break
+                if new_hover == -1 and self.slider_kind and self.slider_hit(pos):
+                    new_hover = self.hovered_index
             if new_hover != self.hovered_index:
                 self.hovered_index = new_hover
+                new_kind = "volume" if new_hover in (2, 3) else "brightness" if new_hover in (5, 6) else None
+                if new_kind != self.slider_kind:
+                    self.slider_kind = new_kind
+                    if new_kind:
+                        self.slider_value = self.read_slider_value(new_kind)
                 self.update()
-            return
-
-        if self.dragging_control and self.pressed_index >= 0:
-            dx = pos.x() - CENTER.x()
-            dy = pos.y() - CENTER.y()
-            angle = math.atan2(dy, dx)
-            base = -math.pi / 2 + self.pressed_index * (math.pi / 4)
-            offset = angle - base - self.rotation
-            self.control_offsets[self.pressed_index] = (
-                offset + math.pi
-            ) % (2 * math.pi) - math.pi
-            self.update()
-            event.accept()
             return
 
         if self.distance(self.press_position, CENTER) > ORB_RADIUS + 10:
@@ -990,10 +1054,10 @@ class CozyOrbit(QWidget):
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
-        if self.dragging_control:
-            self.settings.setValue("control_offsets", self.control_offsets)
-            self.dragging_control = False
-            self.pressed_index = -1
+        if self.slider_dragging:
+            self.slider_dragging = False
+            self.slider_apply_timer.stop()
+            self.apply_slider_value(self.slider_kind, self.slider_value)
             self.rotation_paused = False
             self.rotation_resume_timer.start(500)
             self.press_global_position = None
@@ -1033,6 +1097,7 @@ class CozyOrbit(QWidget):
     def leaveEvent(self, event):
         if self.press_global_position is None and self.hovered_index != -1:
             self.hovered_index = -1
+            self.slider_kind = None
             self.update()
         super().leaveEvent(event)
 
