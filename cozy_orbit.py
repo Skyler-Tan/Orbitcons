@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.7.0
+Cozy Orbit v0.8.0
 A customisable radial desktop control widget for KDE Plasma 6 (Wayland/X11).
 
 Requirements:
@@ -31,7 +31,7 @@ from PySide6.QtCore import (
     QPropertyAnimation, Property, QSettings,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QPainter, QPen, QBrush, QLinearGradient, QIcon,
+    QAction, QColor, QFont, QPainter, QPen, QBrush, QLinearGradient, QIcon, QPixmap,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMenu, QDialog, QVBoxLayout, QHBoxLayout,
@@ -40,7 +40,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Cozy Orbit"
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 ORG_NAME = "CozyOrbit"
 SETTINGS_DOMAIN = "cozy-orbit"
 
@@ -154,13 +154,13 @@ def get_output(args: list[str], fallback: str = "") -> str:
     return fallback
 
 
-def launch_application(name: str) -> bool:
+def launch_application(name: str, arguments: tuple[str, ...] = ()) -> bool:
     executable = shutil.which(name)
     if not executable:
         return False
     try:
         subprocess.Popen(
-            [executable], stdout=subprocess.DEVNULL,
+            [executable, *arguments], stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
         )
         return True
@@ -177,6 +177,7 @@ class WidgetSettingsDialog(QDialog):
         self.setWindowTitle("Cozy Orbit — Widget Settings")
         self.setMinimumWidth(340)
         self.setModal(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
 
         root = QVBoxLayout(self)
         intro = QLabel("Personalise the look and motion of your orbit.")
@@ -271,6 +272,7 @@ class CozyOrbit(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
         self.setFixedSize(SIZE, SIZE)
         self.setMouseTracking(False)
         # Resolve icons from the desktop's active icon theme (normally KDE Breeze).
@@ -279,6 +281,7 @@ class CozyOrbit(QWidget):
         self.theme_name = self.settings.value("theme", "Pastel Pink", type=str)
         if self.theme_name not in THEMES:
             self.theme_name = "Pastel Pink"
+        self.tinted_icons = self.make_tinted_icons()
         self.rotation_enabled = self.settings.value(
             "rotation_enabled", True, type=bool
         )
@@ -297,6 +300,9 @@ class CozyOrbit(QWidget):
         self.press_window_position = None
         self.dragging = False
         self.move_started = False
+        self.rotation_resume_timer = QTimer(self)
+        self.rotation_resume_timer.setSingleShot(True)
+        self.rotation_resume_timer.timeout.connect(self.resume_rotation)
 
         self.wifi = "Unknown"
         self.bluetooth = "Unknown"
@@ -307,6 +313,11 @@ class CozyOrbit(QWidget):
         self.animation = QPropertyAnimation(self, b"progress", self)
         self.animation.setDuration(350)
         self.animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        self._flower_openness = 0.18
+        self.flower_animation = QPropertyAnimation(self, b"flowerOpenness", self)
+        self.flower_animation.setDuration(420)
+        self.flower_animation.setEasingCurve(QEasingCurve.Type.OutBack)
 
         self.frame_timer = QTimer(self)
         self.frame_timer.setInterval(FRAME_INTERVAL_MS)
@@ -330,6 +341,25 @@ class CozyOrbit(QWidget):
         # Level 2 is intentionally gentle: one full revolution takes about 2 minutes.
         return 0.0009 * max(1, min(10, level)) / 2
 
+    def make_tinted_icons(self):
+        """Tint desktop-theme icons to match the current theme's readable text colour."""
+        tint = QColor(THEMES[self.theme_name]["text"])
+        pixmaps = []
+        for icon in self.system_icons:
+            if icon.isNull():
+                pixmaps.append(QPixmap())
+                continue
+            source = icon.pixmap(32, 32)
+            tinted = QPixmap(source.size())
+            tinted.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(tinted)
+            painter.drawPixmap(0, 0, source)
+            painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+            painter.fillRect(tinted.rect(), tint)
+            painter.end()
+            pixmaps.append(tinted)
+        return pixmaps
+
     @property
     def palette(self):
         return THEMES[self.theme_name]
@@ -343,6 +373,15 @@ class CozyOrbit(QWidget):
 
     progress = Property(float, get_progress, set_progress)
 
+    def get_flower_openness(self):
+        return self._flower_openness
+
+    def set_flower_openness(self, value):
+        self._flower_openness = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    flowerOpenness = Property(float, get_flower_openness, set_flower_openness)
+
     def expand(self, state: bool):
         if self.expanded == state:
             return
@@ -351,6 +390,10 @@ class CozyOrbit(QWidget):
         self.animation.setStartValue(self._progress)
         self.animation.setEndValue(1.0 if state else 0.0)
         self.animation.start()
+        self.flower_animation.stop()
+        self.flower_animation.setStartValue(self._flower_openness)
+        self.flower_animation.setEndValue(1.0 if state else 0.18)
+        self.flower_animation.start()
 
     def toggle_expanded(self):
         self.expand(not self.expanded)
@@ -435,10 +478,10 @@ class CozyOrbit(QWidget):
             painter.setBrush(QColor(p["button_a"] if i % 2 == 0 else p["button_b"]))
             painter.drawEllipse(pos, BUTTON_RADIUS, BUTTON_RADIUS)
 
-            icon = self.system_icons[i]
+            icon = self.tinted_icons[i]
             icon_rect = QRectF(pos.x() - 14, pos.y() - 14, 28, 28)
             if not icon.isNull():
-                icon.paint(painter, icon_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
+                painter.drawPixmap(icon_rect.toRect(), icon)
             else:
                 painter.setPen(QColor(p["text"]))
                 painter.setFont(QFont("DejaVu Sans", 14, QFont.Weight.Bold))
@@ -448,22 +491,24 @@ class CozyOrbit(QWidget):
                 )
 
             if self._progress > 0.90:
-                painter.setFont(QFont("DejaVu Sans", 8, QFont.Weight.DemiBold))
+                painter.setFont(QFont("DejaVu Sans", 7, QFont.Weight.DemiBold))
                 painter.setPen(QColor(p["text"]))
                 painter.drawText(
-                    QRectF(pos.x() - 48, pos.y() + 32, 96, 20),
+                    QRectF(pos.x() - 42, pos.y() + 31, 84, 18),
                     Qt.AlignmentFlag.AlignCenter, self.get_label(i),
                 )
             painter.restore()
 
     def get_label(self, index):
+        compact = ["Wi-Fi", "Bluetooth", "Vol −", "Vol +", "Battery",
+                   "Bright −", "Bright +", "Settings"]
         if index == 0:
-            return f"Wi-Fi: {self.wifi}"
+            return f"Wi-Fi {self.wifi}"
         if index == 1:
-            return f"BT: {self.bluetooth}"
+            return f"BT {self.bluetooth}"
         if index == 4:
-            return f"{self.battery} {self.battery_state}".strip()
-        return LABELS[index]
+            return self.battery
+        return compact[index]
 
     def draw_center(self, painter):
         p = self.palette
@@ -483,14 +528,22 @@ class CozyOrbit(QWidget):
         painter.setBrush(QBrush(gradient))
         painter.drawEllipse(CENTER, ORB_RADIUS, ORB_RADIUS)
 
-        painter.setPen(QColor(p["center_icon"]))
-        painter.setFont(QFont("DejaVu Sans", 25, QFont.Weight.Bold))
-        glyph = "×" if self.expanded else "✿"
-        # Use a fallback ASCII flower if the selected font lacks the symbol.
-        painter.drawText(
-            QRectF(CENTER.x() - 25, CENTER.y() - 26, 50, 52),
-            Qt.AlignmentFlag.AlignCenter, glyph,
-        )
+        # Six petals unfold from the centre whenever the orbit opens.
+        petal_colour = QColor(p["center_icon"])
+        painter.setPen(QPen(QColor(p["outline"]), 0.8))
+        painter.setBrush(petal_colour)
+        openness = self._flower_openness
+        for i in range(6):
+            painter.save()
+            painter.translate(CENTER)
+            painter.rotate(i * 60 - 90)
+            painter.translate(0, -8 - 8 * openness)
+            painter.scale(0.55 + 0.45 * openness, 0.55 + 0.45 * openness)
+            painter.drawEllipse(QRectF(-5.5, -10, 11, 17))
+            painter.restore()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(p["accent"]))
+        painter.drawEllipse(CENTER, 5.5, 5.5)
         painter.restore()
 
     def draw_notification(self, painter):
@@ -519,6 +572,13 @@ class CozyOrbit(QWidget):
     # Mouse interaction: no hover expansion or hover highlighting.
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
+            pos = QPointF(event.position())
+            if self._progress > 0.90:
+                for index, point in enumerate(self.get_positions()[:2]):
+                    if self.distance(pos, point) <= BUTTON_RADIUS + 12:
+                        self.open_device_settings("wifi" if index == 0 else "bluetooth")
+                        event.accept()
+                        return
             self.context_menu(event.globalPosition().toPoint())
             return
         if event.button() != Qt.MouseButton.LeftButton:
@@ -533,7 +593,7 @@ class CozyOrbit(QWidget):
         self.pressed_index = -1
 
         if self.distance(pos, CENTER) <= ORB_RADIUS + 10:
-            self.rotation_paused = True
+            # Keep the orbit moving while the centre is pressed or dragged.
             # Do not start a compositor move on every centre click. Starting a
             # move immediately can swallow the click/release on Wayland.
             event.accept()
@@ -544,6 +604,7 @@ class CozyOrbit(QWidget):
                 if self.distance(pos, point) <= BUTTON_RADIUS + 12:
                     self.pressed_index = i
                     self.rotation_paused = True
+                    self.rotation_resume_timer.stop()
                     event.accept()
                     return
 
@@ -578,6 +639,8 @@ class CozyOrbit(QWidget):
                 self.press_window_position = None
                 self.rotation_paused = False
                 self.dragging = False
+                if not self.frame_timer.isActive():
+                    self.frame_timer.start()
                 if not was_drag:
                     self.toggle_expanded()
                 self.update()
@@ -591,7 +654,11 @@ class CozyOrbit(QWidget):
                 QPointF(event.position()), self.get_positions()[index]
             ) <= BUTTON_RADIUS + 14:
                 self.activate(index)
-            self.rotation_paused = False
+                # Hold the orbit still briefly so the selected control is easy
+                # to follow while Wi-Fi/Bluetooth or another action responds.
+                self.rotation_resume_timer.start(900)
+            else:
+                self.rotation_paused = False
             self.update()
         self.press_global_position = None
         self.press_window_position = None
@@ -600,6 +667,10 @@ class CozyOrbit(QWidget):
     def mouseDoubleClickEvent(self, event):
         # Treat a double-click as two deliberate centre clicks, without a special action.
         event.accept()
+
+    def resume_rotation(self):
+        self.rotation_paused = False
+        self.update()
 
     # System status
     def refresh_status(self):
@@ -761,6 +832,7 @@ class CozyOrbit(QWidget):
             "rotation_speed_level", 2, type=int
         )
         self.rotation_speed = self.speed_from_level(self.rotation_speed_level)
+        self.tinted_icons = self.make_tinted_icons()
         if not self.frame_timer.isActive():
             self.frame_timer.start()
         self.update()
@@ -772,6 +844,19 @@ class CozyOrbit(QWidget):
         # Kick a first paint/status refresh after the compositor has mapped us.
         QTimer.singleShot(0, self.update)
         QTimer.singleShot(150, self.refresh_status)
+
+    def open_device_settings(self, device: str):
+        modules = {
+            "wifi": ("kcm_networkmanagement", "Wi-Fi"),
+            "bluetooth": ("kcm_bluetooth", "Bluetooth"),
+        }
+        module, label = modules[device]
+        if launch_application("kcmshell6", (module,)):
+            self.notify(f"Opening {label} settings")
+        elif launch_application("systemsettings", (module,)):
+            self.notify(f"Opening {label} settings")
+        else:
+            self.notify(f"{label} settings unavailable")
 
     def open_kde_settings(self):
         if launch_application("systemsettings"):
@@ -795,6 +880,14 @@ class CozyOrbit(QWidget):
         settings_action = QAction("Cozy Orbit Widget Settings…", menu)
         settings_action.triggered.connect(self.open_widget_settings)
         menu.addAction(settings_action)
+
+        wifi_settings_action = QAction("Wi-Fi Settings…", menu)
+        wifi_settings_action.triggered.connect(lambda: self.open_device_settings("wifi"))
+        menu.addAction(wifi_settings_action)
+
+        bluetooth_settings_action = QAction("Bluetooth Settings…", menu)
+        bluetooth_settings_action.triggered.connect(lambda: self.open_device_settings("bluetooth"))
+        menu.addAction(bluetooth_settings_action)
 
         refresh_action = QAction("Refresh device status", menu)
         refresh_action.triggered.connect(self.refresh_status)
@@ -825,7 +918,9 @@ def main():
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName(ORG_NAME)
     app.setOrganizationDomain(SETTINGS_DOMAIN)
-    app.setQuitOnLastWindowClosed(True)
+    # The floating widget is a Qt.Tool window; closing a preferences dialog
+    # must never make QApplication quit. Quit remains available in the menu.
+    app.setQuitOnLastWindowClosed(False)
 
     widget = CozyOrbit()
     widget.show()
