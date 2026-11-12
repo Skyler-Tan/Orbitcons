@@ -1,18 +1,23 @@
 
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.4.0
-A lightweight, floating radial control panel for Linux.
+Cozy Orbit v0.5.0
+Pastel radial desktop control for Kubuntu / KDE Plasma 6.
 
-Features:
-- Animated pastel radial menu
-- Wi-Fi and Bluetooth controls
-- Volume and brightness controls
-- Battery monitoring
-- Desktop settings launcher
-- Draggable, persistent positioning
-- Hover effects and context menu
-- Parrot OS, Linux Mint, KDE and XFCE support
+Designed for:
+    Kubuntu
+    KDE Plasma 6
+    Wayland
+    PySide6
+
+Interaction:
+    Hover centre       -> Expand
+    Move pointer       -> Select controls
+    Expanded           -> Slowly rotates clockwise
+    Click control      -> Activate
+    Drag centre        -> Move window through KDE compositor
+    Leave window       -> Collapse
+    Right-click        -> Context menu
 """
 
 import math
@@ -23,73 +28,103 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import (
-    QPointF, QRectF, Qt, QTimer
+    Qt,
+    QPointF,
+    QRectF,
+    QTimer,
+    QEasingCurve,
+    QPropertyAnimation,
+    Property,
 )
+
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QPainter, QPen,
-    QRadialGradient
+    QAction,
+    QColor,
+    QFont,
+    QPainter,
+    QPen,
+    QBrush,
+    QLinearGradient,
 )
+
 from PySide6.QtWidgets import (
-    QApplication, QMenu, QWidget, QToolTip
+    QApplication,
+    QWidget,
+    QMenu,
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # CONFIGURATION
-# --------------------------------------------------
+# ==================================================
 
 APP_NAME = "Cozy Orbit"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 APP_DIR = Path.home() / ".local/share/cozy-orbit"
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
-POSITION_FILE = APP_DIR / "position"
-
 SIZE = 420
+
 CENTER = QPointF(210, 210)
 
 ORB_RADIUS = 34
-ITEM_RADIUS = 27
-ORBIT_RADIUS = 126
+BUTTON_RADIUS = 26
+ORBIT_RADIUS = 137
 
+ROTATION_SPEED = 0.0025
 REFRESH_INTERVAL = 3000
 
-# Pastel theme
-COLORS = {
-    "background": QColor(255, 242, 249, 225),
-    "border": QColor(255, 255, 255, 190),
-    "pink": QColor(255, 202, 222),
-    "purple": QColor(213, 196, 246),
-    "dark": QColor(91, 69, 105),
-    "text": QColor(79, 61, 87),
-    "hover": QColor(255, 255, 255, 245),
-    "orb": QColor(255, 206, 222, 250),
-}
+# Pastel colour palette
+
+PINK = QColor("#FFD3E3")
+PINK_DARK = QColor("#F7B8D0")
+
+LAVENDER = QColor("#DCCBFA")
+LAVENDER_DARK = QColor("#C4A9EB")
+
+PURPLE = QColor("#80658F")
+TEXT = QColor("#594563")
+
+WHITE = QColor("#FFFFFF")
+
+# Eight radial controls
 
 LABELS = [
     "Wi-Fi",
     "Bluetooth",
-    "Volume −",
-    "Volume +",
+    "Volume Down",
+    "Volume Up",
     "Battery",
-    "Brightness −",
-    "Brightness +",
+    "Brightness Down",
+    "Brightness Up",
     "Settings",
 ]
 
+# Use ordinary characters to avoid missing
+# Unicode icon fonts on Linux.
+
 ICONS = [
-    "W", "B", "-", "+",
-    "%", "-", "+", "S"
+    "W",
+    "B",
+    "-",
+    "+",
+    "%",
+    "-",
+    "+",
+    "S",
 ]
 
 
-# --------------------------------------------------
-# SYSTEM COMMAND HELPERS
-# --------------------------------------------------
+# ==================================================
+# SYSTEM UTILITIES
+# ==================================================
+
+def has_command(name):
+    return shutil.which(name) is not None
+
 
 def run_command(args, timeout=4):
-    """Run a system command safely."""
 
     try:
         return subprocess.run(
@@ -97,14 +132,18 @@ def run_command(args, timeout=4):
             capture_output=True,
             text=True,
             timeout=timeout,
-            check=False
+            check=False,
         )
 
-    except (OSError, subprocess.TimeoutExpired):
+    except (
+        OSError,
+        subprocess.TimeoutExpired,
+    ):
         return None
 
 
 def get_output(args, fallback=""):
+
     result = run_command(args)
 
     if result and result.returncode == 0:
@@ -113,20 +152,36 @@ def get_output(args, fallback=""):
     return fallback
 
 
-def has_command(name):
-    return shutil.which(name) is not None
+def launch_application(name):
+
+    executable = shutil.which(name)
+
+    if not executable:
+        return False
+
+    try:
+        subprocess.Popen(
+            [executable],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+        return True
+
+    except OSError:
+        return False
 
 
-# --------------------------------------------------
-# MAIN APPLICATION
-# --------------------------------------------------
+# ==================================================
+# MAIN WINDOW
+# ==================================================
 
 class CozyOrbit(QWidget):
 
     def __init__(self):
-        super().__init__()
 
-        self.pressed_index = -1
+        super().__init__()
 
         self.setWindowTitle(APP_NAME)
 
@@ -138,293 +193,203 @@ class CozyOrbit(QWidget):
 
         self.setAttribute(
             Qt.WidgetAttribute.WA_TranslucentBackground,
-            True
+            True,
         )
 
         self.setMouseTracking(True)
+
         self.setFixedSize(SIZE, SIZE)
 
-        # Animation
-        self.expanded = False
-        self.progress = 0.0
+        # ------------------------------------------
+        # Animation state
+        # ------------------------------------------
 
-        # Mouse interaction
-        self.drag_origin = None
-        self.window_origin = None
+        self._progress = 0.0
+
+        self.rotation = 0.0
+
+        self.expanded = False
+
+        self.rotation_paused = False
+
+        # ------------------------------------------
+        # Mouse state
+        # ------------------------------------------
+
         self.hover_index = -1
 
-        # System status
+        self.pressed_index = -1
+
+        self.dragging = False
+
+        # ------------------------------------------
+        # System state
+        # ------------------------------------------
+
         self.wifi = "Unknown"
+
         self.bluetooth = "Unknown"
-        self.battery = "—"
-
-        self.status_message = ""
-        self.status_timer = QTimer(self)
-        self.status_timer.setSingleShot(True)
-        self.status_timer.timeout.connect(
-            self.clear_status
-        )
-
-        # Status refresh timer
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(
-            self.refresh_status
-        )
-        self.timer.start(REFRESH_INTERVAL)
-
-        # Animation timer
-        self.anim = QTimer(self)
-        self.anim.setInterval(16)
-        self.anim.timeout.connect(self.animate)
-
-        self.restore_position()
-        self.refresh_status()
-
-    # --------------------------------------------------
-    # POSITION MANAGEMENT
-    # --------------------------------------------------
-
-    def restore_position(self):
-
-        try:
-            x, y = map(
-                int,
-                POSITION_FILE.read_text().split()
-            )
-
-            self.move(x, y)
-
-            screen = QApplication.primaryScreen()
-            if screen:
-                geometry = screen.availableGeometry()
-                max_x = max(geometry.left(), geometry.right() - SIZE + 1)
-                max_y = max(geometry.top(), geometry.bottom() - SIZE + 1)
-
-                self.move(
-                    max(geometry.left(), min(x, max_x)),
-                    max(geometry.top(), min(y, max_y))
-                )
-
-        except (OSError, ValueError):
-
-            screen = QApplication.primaryScreen()
-
-            if screen:
-                geometry = screen.availableGeometry()
-
-                self.move(
-                    geometry.right() - SIZE - 35,
-                    geometry.bottom() - SIZE - 65
-                )
-
-            else:
-                self.move(100, 100)
-
-    def save_position(self):
-
-        try:
-            POSITION_FILE.write_text(
-                f"{self.x()} {self.y()}\n"
-            )
-        except OSError:
-            pass
-
-    # --------------------------------------------------
-    # SYSTEM STATUS
-    # --------------------------------------------------
-
-    def refresh_status(self):
-
-        self.refresh_wifi()
-        self.refresh_bluetooth()
-        self.refresh_battery()
-
-        self.update()
-
-    def refresh_wifi(self):
-
-        if not has_command("nmcli"):
-            self.wifi = "N/A"
-            return
-
-        state = get_output(
-            ["nmcli", "radio", "wifi"],
-            "Unknown"
-        )
-
-        self.wifi = (
-            "On" if state.lower() == "enabled"
-            else "Off" if state.lower() == "disabled"
-            else "Unknown"
-        )
-
-    def refresh_bluetooth(self):
-
-        if not has_command("bluetoothctl"):
-            self.bluetooth = "N/A"
-            return
-
-        result = run_command(
-            ["bluetoothctl", "show"]
-        )
-
-        if not result:
-            self.bluetooth = "Unknown"
-            return
-
-        text = result.stdout.lower()
-
-        if "powered: yes" in text:
-            self.bluetooth = "On"
-
-        elif "powered: no" in text:
-            self.bluetooth = "Off"
-
-        elif "no default controller" in text:
-            self.bluetooth = "N/A"
-
-        else:
-            self.bluetooth = "Unknown"
-
-    def refresh_battery(self):
-
-        batteries = list(
-            Path("/sys/class/power_supply").glob("BAT*")
-        )
-
-        for battery in batteries:
-
-            try:
-                capacity = (
-                    battery / "capacity"
-                ).read_text().strip()
-
-                if capacity.isdigit():
-                    self.battery = capacity + "%"
-                    return
-
-            except OSError:
-                continue
 
         self.battery = "N/A"
 
-    # --------------------------------------------------
-    # USER FEEDBACK
-    # --------------------------------------------------
+        self.battery_state = ""
 
-    def notify(self, message):
+        self.message = ""
 
-        self.status_message = message
-        self.status_timer.start(2500)
-        self.update()
+        # ------------------------------------------
+        # Expansion animation
+        # ------------------------------------------
 
-    def clear_status(self):
-
-        self.status_message = ""
-        self.update()
-
-    def execute(self, args, success_message):
-
-    if not has_command(args[0]):
-        self.notify(f"Missing: {args[0]}")
-        return False
-
-    result = run_command(args)
-
-    if result is None:
-        self.notify("Command execution failed")
-        return False
-
-    if result.returncode != 0:
-
-        error = result.stderr.strip()
-
-        self.notify(
-            error.splitlines()[-1][:55]
-            if error else "Operation failed"
+        self.animation = QPropertyAnimation(
+            self,
+            b"progress",
+            self,
         )
 
-        return False
+        self.animation.setDuration(450)
 
-    self.notify(success_message)
+        self.animation.setEasingCurve(
+            QEasingCurve.Type.OutCubic
+        )
 
-    QTimer.singleShot(
-        700,
-        self.refresh_status
+        # ------------------------------------------
+        # Main animation timer
+        # ------------------------------------------
+
+        self.frame_timer = QTimer(self)
+
+        self.frame_timer.setInterval(16)
+
+        self.frame_timer.timeout.connect(
+            self.animation_frame
+        )
+
+        self.frame_timer.start()
+
+        # ------------------------------------------
+        # System refresh timer
+        # ------------------------------------------
+
+        self.status_timer = QTimer(self)
+
+        self.status_timer.timeout.connect(
+            self.refresh_status
+        )
+
+        self.status_timer.start(
+            REFRESH_INTERVAL
+        )
+
+        # ------------------------------------------
+        # Notification timer
+        # ------------------------------------------
+
+        self.notification_timer = QTimer(self)
+
+        self.notification_timer.setSingleShot(True)
+
+        self.notification_timer.timeout.connect(
+            self.clear_message
+        )
+
+        # ------------------------------------------
+        # Start
+        # ------------------------------------------
+
+        self.refresh_status()
+
+    # ==================================================
+    # ANIMATION PROPERTY
+    # ==================================================
+
+    def get_progress(self):
+        return self._progress
+
+    def set_progress(self, value):
+
+        self._progress = max(
+            0.0,
+            min(1.0, value),
+        )
+
+        self.update()
+
+    progress = Property(
+        float,
+        get_progress,
+        set_progress,
     )
 
-    return True
-
-    # --------------------------------------------------
-    # ANIMATION
-    # --------------------------------------------------
-
-    def set_expanded(self, state):
+    def expand(self, state):
 
         if self.expanded == state:
             return
 
         self.expanded = state
-        self.anim.start()
 
-    def animate(self):
+        self.animation.stop()
 
-        target = 1.0 if self.expanded else 0.0
+        self.animation.setStartValue(
+            self._progress
+        )
 
-        difference = target - self.progress
+        self.animation.setEndValue(
+            1.0 if state else 0.0
+        )
 
-        if abs(difference) < 0.008:
-            self.progress = target
-            self.anim.stop()
+        self.animation.start()
 
-        else:
-            self.progress += difference * 0.22
+    def animation_frame(self):
 
-        self.update()
+        if self.expanded and not self.rotation_paused:
 
-    # --------------------------------------------------
+            self.rotation = (
+                self.rotation + ROTATION_SPEED
+            ) % (2 * math.pi)
+
+            self.update()
+
+    # ==================================================
     # RADIAL POSITIONS
-    # --------------------------------------------------
+    # ==================================================
 
-    def item_positions(self):
+    def get_positions(self):
 
         positions = []
 
         for i in range(8):
 
-            angle = math.radians(
-                -90 + i * 45
+            angle = (
+                -math.pi / 2
+                + i * (math.pi / 4)
+                + self.rotation
             )
 
-            spin = (
-                (1.0 - self.progress)
-                * math.radians(75)
+            radius = (
+                ORBIT_RADIUS * self._progress
             )
 
-            radius = ORBIT_RADIUS * self.progress
+            x = CENTER.x() + math.cos(angle) * radius
 
-            x = CENTER.x() + math.cos(
-                angle + spin
-            ) * radius
+            y = CENTER.y() + math.sin(angle) * radius
 
-            y = CENTER.y() + math.sin(
-                angle + spin
-            ) * radius
-
-            positions.append(QPointF(x, y))
+            positions.append(
+                QPointF(x, y)
+            )
 
         return positions
 
-    def distance(self, a, b):
+    @staticmethod
+    def distance(a, b):
 
         return math.hypot(
             a.x() - b.x(),
-            a.y() - b.y()
+            a.y() - b.y(),
         )
 
-    # --------------------------------------------------
-    # DRAWING
-    # --------------------------------------------------
+    # ==================================================
+    # PAINTING
+    # ==================================================
 
     def paintEvent(self, event):
 
@@ -434,384 +399,485 @@ class CozyOrbit(QWidget):
             QPainter.RenderHint.Antialiasing
         )
 
+        painter.setRenderHint(
+            QPainter.RenderHint.TextAntialiasing
+        )
+
         self.draw_background(painter)
 
-        if self.progress > 0.001:
-            self.draw_radial_menu(painter)
+        if self._progress > 0.001:
 
-        self.draw_center_orb(painter)
+            self.draw_flower(painter)
+
+            self.draw_controls(painter)
+
+        self.draw_center(painter)
+
+        self.draw_notification(painter)
 
         painter.end()
 
+    # --------------------------------------------------
+    # BACKGROUND
+    # --------------------------------------------------
+
     def draw_background(self, painter):
 
-        if self.progress <= 0:
+        progress = self._progress
+
+        if progress <= 0:
             return
 
-        radius = 176 * self.progress
+        radius = 174 * progress
 
-        gradient = QRadialGradient(
-            CENTER,
-            radius
+        gradient = QLinearGradient(
+            30, 30, SIZE - 30, SIZE - 30
         )
 
         gradient.setColorAt(
             0.0,
-            QColor(255, 246, 252, int(185 * self.progress))
+            QColor(255, 241, 249, int(145 * progress)),
         )
 
         gradient.setColorAt(
             1.0,
-            QColor(226, 207, 244, int(75 * self.progress))
+            QColor(226, 213, 250, int(105 * progress)),
         )
 
         painter.setPen(
             QPen(
-                COLORS["border"],
-                1.3
+                QColor(255, 255, 255, int(175 * progress)),
+                1.4,
             )
         )
 
-        painter.setBrush(gradient)
+        painter.setBrush(
+            QBrush(gradient)
+        )
 
         painter.drawEllipse(
             CENTER,
             radius,
-            radius
+            radius,
         )
 
-    def draw_radial_menu(self, painter):
+    # --------------------------------------------------
+    # FLOWER PETALS
+    # --------------------------------------------------
 
-        positions = self.item_positions()
+    def draw_flower(self, painter):
+
+        progress = self._progress
+
+        # Eight petals surround the centre.
+
+        for i in range(8):
+
+            angle = (
+                -90
+                + i * 45
+                + math.degrees(self.rotation)
+            )
+
+            painter.save()
+
+            painter.translate(CENTER)
+
+            painter.rotate(angle)
+
+            # Petals grow with expansion.
+
+            scale = progress
+
+            painter.scale(
+                scale,
+                scale,
+            )
+
+            painter.setPen(
+                QPen(
+                    QColor(255, 255, 255, 180),
+                    1.2,
+                )
+            )
+
+            painter.setBrush(
+                PINK if i % 2 == 0
+                else LAVENDER
+            )
+
+            painter.drawEllipse(
+                QRectF(
+                    -15,
+                    -94,
+                    30,
+                    63,
+                )
+            )
+
+            painter.restore()
+
+    # --------------------------------------------------
+    # RADIAL BUTTONS
+    # --------------------------------------------------
+
+    def draw_controls(self, painter):
+
+        positions = self.get_positions()
 
         alpha = int(
-            255 * min(1.0, self.progress * 1.8)
+            min(255, self._progress * 255)
         )
 
-        # Connecting lines
-        painter.setPen(
-            QPen(
-                QColor(255, 255, 255, int(120 * self.progress)),
-                1.2
-            )
-        )
-
-        for pos in positions:
-
-            painter.drawLine(
-                CENTER,
-                pos
-            )
-
-        # Control buttons
         for i, pos in enumerate(positions):
 
-            hovered = i == self.hover_index
+            hovered = (
+                i == self.hover_index
+            )
 
-            if hovered:
-                painter.setBrush(
-                    COLORS["hover"]
-                )
-            else:
-                painter.setBrush(
-                    QColor(
-                        COLORS["pink"] if i % 2 == 0
-                        else COLORS["purple"]
-                    )
-                )
+            painter.save()
+
+            # Button shadow
+
+            painter.setPen(
+                Qt.PenStyle.NoPen
+            )
+
+            painter.setBrush(
+                QColor(90, 65, 110, int(35 * self._progress))
+            )
+
+            painter.drawEllipse(
+                QPointF(pos.x() + 2, pos.y() + 3),
+                BUTTON_RADIUS + 1,
+                BUTTON_RADIUS + 1,
+            )
+
+            # Button body
 
             painter.setPen(
                 QPen(
                     QColor(255, 255, 255, alpha),
-                    1.5
+                    1.6,
                 )
             )
 
-            r = ITEM_RADIUS + (3 if hovered else 0)
+            if hovered:
+
+                painter.setBrush(
+                    WHITE
+                )
+
+                radius = BUTTON_RADIUS + 3
+
+            else:
+
+                painter.setBrush(
+                    PINK if i % 2 == 0
+                    else LAVENDER
+                )
+
+                radius = BUTTON_RADIUS
 
             painter.drawEllipse(
                 pos,
-                r,
-                r
+                radius,
+                radius,
             )
 
-            # Icons
+            # Icon
+
             painter.setPen(
-                QColor(91, 69, 105, alpha)
+                TEXT
             )
 
             painter.setFont(
-                QFont("DejaVu Sans", 13, QFont.Weight.Bold)
+                QFont(
+                    "DejaVu Sans",
+                    14,
+                    QFont.Weight.Bold,
+                )
             )
 
             painter.drawText(
                 QRectF(
-                    pos.x() - 18,
-                    pos.y() - 16,
-                    36,
-                    32
+                    pos.x() - 17,
+                    pos.y() - 17,
+                    34,
+                    34,
                 ),
                 Qt.AlignmentFlag.AlignCenter,
-                ICONS[i]
+                ICONS[i],
             )
 
             # Labels
-            if self.progress > 0.88:
+
+            if self._progress > 0.90:
+
+                label = self.get_label(i)
 
                 painter.setFont(
-                    QFont("Noto Sans", 8)
+                    QFont(
+                        "DejaVu Sans",
+                        8,
+                        QFont.Weight.DemiBold,
+                    )
                 )
 
                 painter.setPen(
-                    QColor(72, 58, 78, alpha)
+                    QColor(75, 58, 85, alpha)
                 )
-
-                label = self.LABELS[i]
-
-                if i == 0:
-                    label = f"Wi-Fi: {self.wifi}"
-
-                elif i == 1:
-                    label = f"BT: {self.bluetooth}"
-
-                elif i == 4:
-                    label = self.battery
 
                 painter.drawText(
                     QRectF(
-                        pos.x() - 41,
-                        pos.y() + 30,
-                        82,
-                        20
+                        pos.x() - 48,
+                        pos.y() + 32,
+                        96,
+                        20,
                     ),
                     Qt.AlignmentFlag.AlignCenter,
-                    label
+                    label,
                 )
 
-        # Feedback message
-        if self.status_message:
+            painter.restore()
 
-            painter.setPen(
-                QColor(91, 69, 105, alpha)
-            )
+    def get_label(self, index):
 
-            painter.setFont(
-                QFont("Noto Sans", 9)
-            )
+        if index == 0:
+            return f"Wi-Fi: {self.wifi}"
 
-            painter.drawText(
-                QRectF(65, 390, 290, 20),
-                Qt.AlignmentFlag.AlignCenter,
-                self.status_message
-            )
+        if index == 1:
+            return f"BT: {self.bluetooth}"
 
-    def draw_center_orb(self, painter):
+        if index == 4:
+            return f"{self.battery} {self.battery_state}"
 
-        # Soft shadow
-        painter.setPen(Qt.PenStyle.NoPen)
+        return LABELS[index]
+
+    # --------------------------------------------------
+    # CENTRE FLOWER
+    # --------------------------------------------------
+
+    def draw_center(self, painter):
+
+        painter.save()
+
+        # Shadow
+
+        painter.setPen(
+            Qt.PenStyle.NoPen
+        )
 
         painter.setBrush(
-            QColor(120, 90, 130, 35)
+            QColor(90, 60, 100, 45)
         )
 
         painter.drawEllipse(
             QPointF(
                 CENTER.x() + 2,
-                CENTER.y() + 4
+                CENTER.y() + 4,
             ),
-            ORB_RADIUS + 2,
-            ORB_RADIUS + 2
+            ORB_RADIUS + 3,
+            ORB_RADIUS + 3,
         )
 
-        # Main orb
+        # Centre body
+
         painter.setPen(
             QPen(
-                QColor(255, 255, 255, 240),
-                2
+                WHITE,
+                2,
             )
         )
 
+        gradient = QLinearGradient(
+            CENTER.x() - ORB_RADIUS,
+            CENTER.y() - ORB_RADIUS,
+            CENTER.x() + ORB_RADIUS,
+            CENTER.y() + ORB_RADIUS,
+        )
+
+        gradient.setColorAt(
+            0.0,
+            QColor("#FFE5EE"),
+        )
+
+        gradient.setColorAt(
+            1.0,
+            QColor("#E4D4FA"),
+        )
+
         painter.setBrush(
-            COLORS["orb"]
+            QBrush(gradient)
         )
 
         painter.drawEllipse(
             CENTER,
             ORB_RADIUS,
-            ORB_RADIUS
+            ORB_RADIUS,
         )
 
-        # Flower icon
+        # Centre flower icon
+
         painter.setPen(
-            COLORS["dark"]
+            QColor("#916A9E")
         )
 
         painter.setFont(
             QFont(
-                "Noto Sans",
-                21,
-                QFont.Weight.Bold
+                "DejaVu Sans",
+                25,
+                QFont.Weight.Bold,
             )
         )
 
         painter.drawText(
             QRectF(
                 CENTER.x() - 25,
-                CENTER.y() - 23,
+                CENTER.y() - 26,
                 50,
-                46
+                52,
             ),
             Qt.AlignmentFlag.AlignCenter,
-            "✿"
+            "*",
         )
 
+        painter.restore()
+
     # --------------------------------------------------
+    # NOTIFICATIONS
+    # --------------------------------------------------
+
+    def draw_notification(self, painter):
+
+        if not self.message:
+            return
+
+        painter.save()
+
+        painter.setPen(
+            Qt.PenStyle.NoPen
+        )
+
+        painter.setBrush(
+            QColor(255, 255, 255, 220)
+        )
+
+        painter.drawRoundedRect(
+            QRectF(100, 375, 220, 27),
+            12,
+            12,
+        )
+
+        painter.setPen(
+            TEXT
+        )
+
+        painter.setFont(
+            QFont(
+                "DejaVu Sans",
+                9,
+            )
+        )
+
+        painter.drawText(
+            QRectF(105, 375, 210, 27),
+            Qt.AlignmentFlag.AlignCenter,
+            self.message,
+        )
+
+        painter.restore()
+
+    def notify(self, message):
+
+        self.message = message[:55]
+
+        self.notification_timer.start(2500)
+
+        self.update()
+
+    def clear_message(self):
+
+        self.message = ""
+
+        self.update()
+
+    # ==================================================
     # MOUSE INTERACTION
-    # --------------------------------------------------
+    # ==================================================
 
-    
-def mouseMoveEvent(self, event):
+    def enterEvent(self, event):
 
-    pos = QPointF(event.position())
+        self.expand(True)
 
-    # Dragging the centre orb
-    if self.drag_origin is not None:
-
-        delta = (
-            event.globalPosition().toPoint()
-            - self.drag_origin
-        )
-
-        self.move(self.window_origin + delta)
-        return
-
-    distance = self.distance(pos, CENTER)
-
-    # Keep the menu open while the cursor
-    # moves inside the radial control area.
-    inside_orb = distance < ORB_RADIUS + 12
-
-    inside_menu = (
-        self.expanded and distance < 190
-    )
-
-    self.set_expanded(
-        inside_orb or inside_menu
-    )
-
-    # Only detect button hovering after
-    # the animation has completed.
-    self.hover_index = -1
-
-    if self.progress > 0.95:
-
-        for i, point in enumerate(self.target_positions()):
-
-            if self.distance(pos, point) < ITEM_RADIUS + 12:
-                self.hover_index = i
-                break
-
-    if self.hover_index >= 0:
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-    else:
-        self.unsetCursor()
-
-    self.update()
-
-
-def leaveEvent(self, event):
-
-    self.hover_index = -1
-    self.pressed_index = -1
-    self.set_expanded(False)
-    self.unsetCursor()
-
-
-def mousePressEvent(self, event):
-
-    pos = QPointF(event.position())
-
-    if event.button() == Qt.MouseButton.RightButton:
-
-        self.context_menu(
-            event.globalPosition().toPoint()
-        )
-
-        return
-
-    if event.button() != Qt.MouseButton.LeftButton:
-        return
-
-    # Detect radial button clicks first.
-    if self.progress > 0.95:
-
-        for i, point in enumerate(self.target_positions()):
-
-            if self.distance(pos, point) < ITEM_RADIUS + 12:
-
-                self.pressed_index = i
-                return
-
-    # Centre orb: dragging or expanding.
-    if self.distance(pos, CENTER) < ORB_RADIUS + 12:
-
-        self.drag_origin = (
-            event.globalPosition().toPoint()
-        )
-
-        self.window_origin = self.pos()
-
-
-def mouseReleaseEvent(self, event):
-
-    if event.button() != Qt.MouseButton.LeftButton:
-        return
-
-    pos = QPointF(event.position())
-
-    # Handle radial button click.
-    if self.pressed_index >= 0:
-
-        index = self.pressed_index
-        self.pressed_index = -1
-
-        if self.progress > 0.95:
-
-            point = self.target_positions()[index]
-
-            if self.distance(pos, point) < ITEM_RADIUS + 12:
-                self.activate(index)
-
-        return
-
-    # Handle centre orb dragging.
-    if self.drag_origin is not None:
-
-        moved = (
-            event.globalPosition().toPoint()
-            - self.drag_origin
-        ).manhattanLength() > 5
-
-        self.drag_origin = None
-
-        if moved:
-            self.save_position()
-
-        else:
-            self.set_expanded(not self.expanded)
-
-        return
-
+        super().enterEvent(event)
 
     def leaveEvent(self, event):
 
         self.hover_index = -1
-        self.set_expanded(False)
+
+        self.pressed_index = -1
+
+        self.rotation_paused = False
+
+        self.expand(False)
+
         self.unsetCursor()
 
-    def mousePressEvent(self, event):
+        self.update()
+
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event):
 
         pos = QPointF(event.position())
+
+        if self.dragging:
+            return
+
+        # Find hovered button.
+
+        self.hover_index = -1
+
+        if self._progress > 0.90:
+
+            for i, point in enumerate(
+                self.get_positions()
+            ):
+
+                if self.distance(
+                    pos,
+                    point,
+                ) < BUTTON_RADIUS + 12:
+
+                    self.hover_index = i
+
+                    break
+
+        # Pointer feedback
+
+        if self.hover_index >= 0:
+
+            self.setCursor(
+                Qt.CursorShape.PointingHandCursor
+            )
+
+        elif self.distance(
+            pos,
+            CENTER,
+        ) < ORB_RADIUS + 10:
+
+            self.setCursor(
+                Qt.CursorShape.OpenHandCursor
+            )
+
+        else:
+
+            self.unsetCursor()
+
+        self.update()
+
+    def mousePressEvent(self, event):
 
         if event.button() == Qt.MouseButton.RightButton:
 
@@ -821,91 +887,317 @@ def mouseReleaseEvent(self, event):
 
             return
 
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
 
-            if self.distance(pos, CENTER) < ORB_RADIUS + 10:
+        pos = QPointF(event.position())
 
-                self.drag_origin = (
-                    event.globalPosition().toPoint()
-                )
+        # Check centre first for dragging.
 
-                self.window_origin = self.pos()
+        if self.distance(
+            pos,
+            CENTER,
+        ) < ORB_RADIUS + 10:
 
-                self.setCursor(
-                    Qt.CursorShape.ClosedHandCursor
-                )
+            self.rotation_paused = True
+
+            handle = self.windowHandle()
+
+            if handle is not None:
+
+                # Native KDE / Wayland window movement.
+                # Must be initiated during mouse press.
+
+                if handle.startSystemMove():
+
+                    self.dragging = True
+
+                    return
+
+            self.notify(
+                "Window movement unavailable"
+            )
+
+            return
+
+        # Check radial buttons.
+
+        if self._progress > 0.90:
+
+            for i, point in enumerate(
+                self.get_positions()
+            ):
+
+                if self.distance(
+                    pos,
+                    point,
+                ) < BUTTON_RADIUS + 12:
+
+                    self.pressed_index = i
+
+                    self.rotation_paused = True
+
+                    return
 
     def mouseReleaseEvent(self, event):
 
         if event.button() != Qt.MouseButton.LeftButton:
             return
 
-        if self.drag_origin is not None:
+        if self.dragging:
 
-            moved = (
-                event.globalPosition().toPoint()
-                - self.drag_origin
-            ).manhattanLength() > 5
+            self.dragging = False
 
-            self.drag_origin = None
-
-            self.unsetCursor()
-
-            if moved:
-                self.save_position()
-
-            else:
-                self.set_expanded(
-                    not self.expanded
-                )
+            self.rotation_paused = False
 
             return
 
-        pos = QPointF(event.position())
+        if self.pressed_index >= 0:
 
-        for i, point in enumerate(
-            self.item_positions()
-        ):
+            index = self.pressed_index
 
-            if self.distance(pos, point) < ITEM_RADIUS + 10:
+            self.pressed_index = -1
 
-                self.activate(i)
-                return
+            if self._progress > 0.90:
 
-    # --------------------------------------------------
-    # SYSTEM CONTROLS
-    # --------------------------------------------------
+                positions = self.get_positions()
+
+                if self.distance(
+                    QPointF(event.position()),
+                    positions[index],
+                ) < BUTTON_RADIUS + 14:
+
+                    self.activate(index)
+
+            self.rotation_paused = False
+
+            self.update()
+
+    # ==================================================
+    # SYSTEM STATUS
+    # ==================================================
+
+    def refresh_status(self):
+
+        self.refresh_wifi()
+
+        self.refresh_bluetooth()
+
+        self.refresh_battery()
+
+        self.update()
+
+    def refresh_wifi(self):
+
+        if not has_command("nmcli"):
+
+            self.wifi = "N/A"
+
+            return
+
+        state = get_output(
+            [
+                "nmcli",
+                "radio",
+                "wifi",
+            ],
+            "unknown",
+        )
+
+        if state.lower() == "enabled":
+
+            self.wifi = "On"
+
+        elif state.lower() == "disabled":
+
+            self.wifi = "Off"
+
+        else:
+
+            self.wifi = "Unknown"
+
+    def refresh_bluetooth(self):
+
+        if not has_command("bluetoothctl"):
+
+            self.bluetooth = "N/A"
+
+            return
+
+        result = run_command(
+            [
+                "bluetoothctl",
+                "show",
+            ]
+        )
+
+        if result is None:
+
+            self.bluetooth = "Unknown"
+
+            return
+
+        text = result.stdout.lower()
+
+        if "powered: yes" in text:
+
+            self.bluetooth = "On"
+
+        elif "powered: no" in text:
+
+            self.bluetooth = "Off"
+
+        elif "no default controller" in text:
+
+            self.bluetooth = "N/A"
+
+        else:
+
+            self.bluetooth = "Unknown"
+
+    def refresh_battery(self):
+
+        batteries = list(
+            Path(
+                "/sys/class/power_supply"
+            ).glob("BAT*")
+        )
+
+        for battery in batteries:
+
+            try:
+
+                capacity = (
+                    battery / "capacity"
+                ).read_text().strip()
+
+                state = (
+                    battery / "status"
+                ).read_text().strip()
+
+                if capacity.isdigit():
+
+                    self.battery = capacity + "%"
+
+                    self.battery_state = state
+
+                    return
+
+            except OSError:
+
+                continue
+
+        self.battery = "N/A"
+
+        self.battery_state = ""
+
+    # ==================================================
+    # COMMAND EXECUTION
+    # ==================================================
+
+    def execute(self, args, success_message):
+
+        if not has_command(args[0]):
+
+            self.notify(
+                f"Missing: {args[0]}"
+            )
+
+            return False
+
+        result = run_command(args)
+
+        if result is None:
+
+            self.notify(
+                "Command execution failed"
+            )
+
+            return False
+
+        if result.returncode != 0:
+
+            error = result.stderr.strip()
+
+            if error:
+
+                self.notify(
+                    error.splitlines()[-1][:55]
+                )
+
+            else:
+
+                self.notify(
+                    "Operation failed"
+                )
+
+            return False
+
+        self.notify(success_message)
+
+        QTimer.singleShot(
+            700,
+            self.refresh_status,
+        )
+
+        return True
+
+    # ==================================================
+    # CONTROL ACTIONS
+    # ==================================================
 
     def activate(self, index):
 
         if index == 0:
+
             self.toggle_wifi()
 
         elif index == 1:
+
             self.toggle_bluetooth()
 
         elif index == 2:
+
             self.change_volume("-5%")
 
         elif index == 3:
+
             self.change_volume("+5%")
 
         elif index == 4:
-            self.open_battery_info()
+
+            self.notify(
+                f"Battery: {self.battery}"
+                + (
+                    f" ({self.battery_state})"
+                    if self.battery_state else ""
+                )
+            )
 
         elif index == 5:
+
             self.change_brightness("5%-")
 
         elif index == 6:
+
             self.change_brightness("5%+")
 
         elif index == 7:
+
             self.open_settings()
+
+    # --------------------------------------------------
+    # WI-FI
+    # --------------------------------------------------
 
     def toggle_wifi(self):
 
         if self.wifi not in ("On", "Off"):
-            self.notify("Wi-Fi status unavailable")
+
+            self.notify(
+                "Wi-Fi status unavailable"
+            )
+
             return
 
         state = (
@@ -914,14 +1206,27 @@ def mouseReleaseEvent(self, event):
         )
 
         self.execute(
-            ["nmcli", "radio", "wifi", state],
-            f"Wi-Fi {state.upper()}"
+            [
+                "nmcli",
+                "radio",
+                "wifi",
+                state,
+            ],
+            f"Wi-Fi {state.upper()}",
         )
+
+    # --------------------------------------------------
+    # BLUETOOTH
+    # --------------------------------------------------
 
     def toggle_bluetooth(self):
 
         if self.bluetooth not in ("On", "Off"):
-            self.notify("Bluetooth unavailable")
+
+            self.notify(
+                "Bluetooth unavailable"
+            )
+
             return
 
         state = (
@@ -930,141 +1235,99 @@ def mouseReleaseEvent(self, event):
         )
 
         self.execute(
-            ["bluetoothctl", "power", state],
-            f"Bluetooth {state.upper()}"
+            [
+                "bluetoothctl",
+                "power",
+                state,
+            ],
+            f"Bluetooth {state.upper()}",
         )
+
+    # --------------------------------------------------
+    # VOLUME
+    # --------------------------------------------------
 
     def change_volume(self, amount):
 
-        if has_command("pactl"):
+        if has_command("wpctl"):
 
-            self.execute(
-                [
-                    "pactl",
-                    "set-sink-volume",
-                    "@DEFAULT_SINK@",
-                    amount
-                ],
-                f"Volume {amount}"
+            value = (
+                "5%+" if amount == "+5%"
+                else "5%-"
             )
-
-        elif has_command("wpctl"):
 
             self.execute(
                 [
                     "wpctl",
                     "set-volume",
                     "@DEFAULT_AUDIO_SINK@",
-                    amount
+                    value,
                 ],
-                f"Volume {amount}"
+                f"Volume {amount}",
+            )
+
+        elif has_command("pactl"):
+
+            self.execute(
+                [
+                    "pactl",
+                    "set-sink-volume",
+                    "@DEFAULT_SINK@",
+                    amount,
+                ],
+                f"Volume {amount}",
             )
 
         else:
-            self.notify("Audio control unavailable")
+
+            self.notify(
+                "Audio control unavailable"
+            )
+
+    # --------------------------------------------------
+    # BRIGHTNESS
+    # --------------------------------------------------
 
     def change_brightness(self, amount):
 
         if not has_command("brightnessctl"):
-            self.notify("Install brightnessctl first")
+
+            self.notify(
+                "Install brightnessctl"
+            )
+
             return
 
         self.execute(
             [
                 "brightnessctl",
                 "set",
-                amount
+                amount,
             ],
-            f"Brightness {amount}"
+            f"Brightness {amount}",
         )
 
     # --------------------------------------------------
-    # SETTINGS AND BATTERY
+    # KDE SETTINGS
     # --------------------------------------------------
 
     def open_settings(self):
 
-        desktop = os.environ.get(
-            "XDG_CURRENT_DESKTOP",
-            ""
-        ).lower()
+        if launch_application("systemsettings"):
 
-        if "kde" in desktop:
-            candidates = [
-                "systemsettings",
-                "xfce4-settings-manager",
-                "gnome-control-center"
-            ]
-
-        elif "xfce" in desktop:
-            candidates = [
-                "xfce4-settings-manager",
-                "gnome-control-center",
-                "systemsettings"
-            ]
-
-        elif "gnome" in desktop or "cinnamon" in desktop:
-            candidates = [
-                "gnome-control-center",
-                "cinnamon-settings",
-                "xfce4-settings-manager"
-            ]
-
-        else:
-            candidates = [
-                "xfce4-settings-manager",
-                "systemsettings",
-                "gnome-control-center",
-                "cinnamon-settings"
-            ]
-
-        for app in candidates:
-
-            executable = shutil.which(app)
-
-            if executable:
-
-                try:
-                    subprocess.Popen(
-                        [executable],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True
-                    )
-
-                    self.notify("Opening settings")
-                    return
-
-                except OSError:
-                    continue
-
-        self.notify("Settings application not found")
-
-    def open_battery_info(self):
-
-        if has_command("xfce4-power-manager-settings"):
-
-            executable = shutil.which(
-                "xfce4-power-manager-settings"
+            self.notify(
+                "Opening KDE Settings"
             )
 
-            if executable:
-                subprocess.Popen(
-                    [executable],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True
-                )
+        else:
 
-                return
+            self.notify(
+                "KDE Settings not found"
+            )
 
-        self.notify(
-            f"Battery: {self.battery}"
-        )
-
-    # --------------------------------------------------
+    # ==================================================
     # CONTEXT MENU
-    # --------------------------------------------------
+    # ==================================================
 
     def context_menu(self, point):
 
@@ -1072,52 +1335,58 @@ def mouseReleaseEvent(self, event):
 
         menu.setStyleSheet("""
             QMenu {
-                background-color: #fff5fa;
+                background: #FFF5FA;
                 color: #594563;
-                border: 1px solid #e8d6ed;
-                border-radius: 9px;
+                border: 1px solid #E8D6ED;
+                border-radius: 10px;
                 padding: 6px;
             }
 
             QMenu::item {
-                padding: 8px 24px;
+                padding: 8px 22px;
                 border-radius: 5px;
             }
 
             QMenu::item:selected {
-                background-color: #e8d9f5;
+                background: #E8D9F5;
+            }
+
+            QMenu::separator {
+                height: 1px;
+                background: #E8D6ED;
+                margin: 5px 8px;
             }
         """)
 
-        refresh_action = QAction(
-            "↻  Refresh status",
-            menu
+        refresh = QAction(
+            "Refresh status",
+            menu,
         )
 
-        refresh_action.triggered.connect(
+        refresh.triggered.connect(
             self.refresh_status
         )
 
-        menu.addAction(refresh_action)
+        menu.addAction(refresh)
 
         menu.addSeparator()
 
-        reset_action = QAction(
-            "⌖  Reset position",
-            menu
+        settings = QAction(
+            "KDE System Settings",
+            menu,
         )
 
-        reset_action.triggered.connect(
-            self.reset_position
+        settings.triggered.connect(
+            self.open_settings
         )
 
-        menu.addAction(reset_action)
+        menu.addAction(settings)
 
         menu.addSeparator()
 
         quit_action = QAction(
-            "✕  Quit Cozy Orbit",
-            menu
+            "Quit Cozy Orbit",
+            menu,
         )
 
         quit_action.triggered.connect(
@@ -1128,70 +1397,39 @@ def mouseReleaseEvent(self, event):
 
         menu.exec(point)
 
-    def reset_position(self):
-
-        try:
-            POSITION_FILE.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-        screen = QApplication.primaryScreen()
-
-        if screen:
-
-            geometry = screen.availableGeometry()
-
-            self.move(
-                geometry.right() - SIZE - 35,
-                geometry.bottom() - SIZE - 65
-            )
-
-            self.save_position()
-
-    # --------------------------------------------------
+    # ==================================================
     # CLEANUP
-    # --------------------------------------------------
+    # ==================================================
 
     def closeEvent(self, event):
 
-        self.timer.stop()
-        self.anim.stop()
+        self.frame_timer.stop()
 
-        self.save_position()
+        self.status_timer.stop()
+
+        self.notification_timer.stop()
+
+        self.animation.stop()
 
         event.accept()
 
-    def target_positions(self):
 
-    positions = []
-
-    for i in range(8):
-        angle = math.radians(-90 + i * 45)
-
-        positions.append(
-            QPointF(
-                CENTER.x() + math.cos(angle) * ORBIT_RADIUS,
-                CENTER.y() + math.sin(angle) * ORBIT_RADIUS
-            )
-        )
-
-    return positions
-
-
-# --------------------------------------------------
+# ==================================================
 # APPLICATION ENTRY
-# --------------------------------------------------
+# ==================================================
 
 def main():
 
     app = QApplication(sys.argv)
 
     app.setApplicationName(APP_NAME)
+
     app.setApplicationVersion(VERSION)
 
     app.setQuitOnLastWindowClosed(True)
 
     widget = CozyOrbit()
+
     widget.show()
 
     return app.exec()
@@ -1200,13 +1438,14 @@ def main():
 if __name__ == "__main__":
 
     try:
+
         sys.exit(main())
 
     except Exception as exc:
 
         print(
-            f"{APP_NAME} failed: {exc}",
-            file=sys.stderr
+            f"Cozy Orbit error: {exc}",
+            file=sys.stderr,
         )
 
         raise
