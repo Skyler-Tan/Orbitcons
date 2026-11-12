@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.6.0
+Cozy Orbit v0.7.0
 A customisable radial desktop control widget for KDE Plasma 6 (Wayland/X11).
 
 Requirements:
@@ -20,6 +20,7 @@ User preferences are stored using QSettings.
 from __future__ import annotations
 
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -30,16 +31,16 @@ from PySide6.QtCore import (
     QPropertyAnimation, Property, QSettings,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QPainter, QPen, QBrush, QLinearGradient,
+    QAction, QColor, QFont, QPainter, QPen, QBrush, QLinearGradient, QIcon,
 )
 from PySide6.QtWidgets import (
     QApplication, QWidget, QMenu, QDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QSlider, QCheckBox, QDialogButtonBox,
-    QFormLayout, QGroupBox, QPushButton,
+    QFormLayout, QGroupBox, QPushButton, QMessageBox,
 )
 
 APP_NAME = "Cozy Orbit"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 ORG_NAME = "CozyOrbit"
 SETTINGS_DOMAIN = "cozy-orbit"
 
@@ -56,7 +57,28 @@ LABELS = [
     "Wi-Fi", "Bluetooth", "Volume Down", "Volume Up",
     "Battery", "Brightness Down", "Brightness Up", "Settings",
 ]
-ICONS = ["W", "B", "−", "+", "%", "−", "+", "S"]
+# Prefer the active desktop icon theme (Breeze on KDE). Text fallbacks are
+# used only when a theme does not provide one of these standard icon names.
+SYSTEM_ICON_CANDIDATES = [
+    ("network-wireless", "network-wireless-connected"),
+    ("bluetooth", "bluetooth-active"),
+    ("audio-volume-low", "audio-volume-medium"),
+    ("audio-volume-high", "audio-volume-medium"),
+    ("battery", "battery-full"),
+    ("display-brightness-low", "display-brightness", "preferences-desktop-display"),
+    ("display-brightness-high", "display-brightness", "preferences-desktop-display"),
+    ("preferences-system", "settings-configure"),
+]
+ICON_FALLBACKS = ["W", "B", "−", "+", "%", "−", "+", "⚙"]
+
+
+def desktop_icon(candidates: tuple[str, ...]) -> QIcon:
+    """Return the first icon available in the user's current desktop theme."""
+    for name in candidates:
+        icon = QIcon.fromTheme(name)
+        if not icon.isNull():
+            return icon
+    return QIcon()
 
 THEMES = {
     "Pastel Pink": {
@@ -251,6 +273,8 @@ class CozyOrbit(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(SIZE, SIZE)
         self.setMouseTracking(False)
+        # Resolve icons from the desktop's active icon theme (normally KDE Breeze).
+        self.system_icons = [desktop_icon(names) for names in SYSTEM_ICON_CANDIDATES]
 
         self.theme_name = self.settings.value("theme", "Pastel Pink", type=str)
         if self.theme_name not in THEMES:
@@ -270,6 +294,7 @@ class CozyOrbit(QWidget):
         self.pressed_index = -1
         self.press_position = QPointF()
         self.press_global_position = None
+        self.press_window_position = None
         self.dragging = False
         self.move_started = False
 
@@ -285,8 +310,10 @@ class CozyOrbit(QWidget):
 
         self.frame_timer = QTimer(self)
         self.frame_timer.setInterval(FRAME_INTERVAL_MS)
+        self.frame_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.frame_timer.timeout.connect(self.animation_frame)
-        self.frame_timer.start()
+        # Start after the window is shown; this avoids an occasional missed
+        # first animation frame during Wayland window initialisation.
 
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self.refresh_status)
@@ -408,12 +435,17 @@ class CozyOrbit(QWidget):
             painter.setBrush(QColor(p["button_a"] if i % 2 == 0 else p["button_b"]))
             painter.drawEllipse(pos, BUTTON_RADIUS, BUTTON_RADIUS)
 
-            painter.setPen(QColor(p["text"]))
-            painter.setFont(QFont("DejaVu Sans", 14, QFont.Weight.Bold))
-            painter.drawText(
-                QRectF(pos.x() - 17, pos.y() - 17, 34, 34),
-                Qt.AlignmentFlag.AlignCenter, ICONS[i],
-            )
+            icon = self.system_icons[i]
+            icon_rect = QRectF(pos.x() - 14, pos.y() - 14, 28, 28)
+            if not icon.isNull():
+                icon.paint(painter, icon_rect.toRect(), Qt.AlignmentFlag.AlignCenter)
+            else:
+                painter.setPen(QColor(p["text"]))
+                painter.setFont(QFont("DejaVu Sans", 14, QFont.Weight.Bold))
+                painter.drawText(
+                    QRectF(pos.x() - 17, pos.y() - 17, 34, 34),
+                    Qt.AlignmentFlag.AlignCenter, ICON_FALLBACKS[i],
+                )
 
             if self._progress > 0.90:
                 painter.setFont(QFont("DejaVu Sans", 8, QFont.Weight.DemiBold))
@@ -495,16 +527,15 @@ class CozyOrbit(QWidget):
         pos = QPointF(event.position())
         self.press_position = pos
         self.press_global_position = event.globalPosition().toPoint()
+        self.press_window_position = self.pos()
         self.dragging = False
         self.move_started = False
         self.pressed_index = -1
 
         if self.distance(pos, CENTER) <= ORB_RADIUS + 10:
             self.rotation_paused = True
-            # On Wayland, the compositor must initiate the move from a mouse press.
-            handle = self.windowHandle()
-            if handle is not None:
-                self.move_started = bool(handle.startSystemMove())
+            # Do not start a compositor move on every centre click. Starting a
+            # move immediately can swallow the click/release on Wayland.
             event.accept()
             return
 
@@ -522,11 +553,18 @@ class CozyOrbit(QWidget):
         current = event.globalPosition().toPoint()
         dx = current.x() - self.press_global_position.x()
         dy = current.y() - self.press_global_position.y()
-        if math.hypot(dx, dy) >= DRAG_THRESHOLD and self.distance(
-            self.press_position, CENTER
-        ) <= ORB_RADIUS + 10:
+        if (not self.dragging and math.hypot(dx, dy) >= DRAG_THRESHOLD
+                and self.distance(self.press_position, CENTER) <= ORB_RADIUS + 10):
             self.dragging = True
-        # The compositor handles the actual movement after startSystemMove().
+            # Begin a native move only after the pointer has actually moved.
+            # This keeps an ordinary click reliable while preserving Wayland drag.
+            handle = self.windowHandle()
+            if handle is not None:
+                self.move_started = bool(handle.startSystemMove())
+            if not self.move_started and os.environ.get("XDG_SESSION_TYPE") != "wayland":
+                self.move(current - (self.press_global_position - self.press_window_position))
+        elif self.dragging and not self.move_started and os.environ.get("XDG_SESSION_TYPE") != "wayland":
+            self.move(current - (self.press_global_position - self.press_window_position))
         event.accept()
 
     def mouseReleaseEvent(self, event):
@@ -537,6 +575,7 @@ class CozyOrbit(QWidget):
             if self.distance(self.press_position, CENTER) <= ORB_RADIUS + 10:
                 was_drag = self.dragging
                 self.press_global_position = None
+                self.press_window_position = None
                 self.rotation_paused = False
                 self.dragging = False
                 if not was_drag:
@@ -555,6 +594,7 @@ class CozyOrbit(QWidget):
             self.rotation_paused = False
             self.update()
         self.press_global_position = None
+        self.press_window_position = None
         event.accept()
 
     def mouseDoubleClickEvent(self, event):
@@ -618,8 +658,13 @@ class CozyOrbit(QWidget):
             self.notify("Command execution failed")
             return False
         if result.returncode != 0:
-            error = result.stderr.strip()
-            self.notify(error.splitlines()[-1][:58] if error else "Operation failed")
+            error = result.stderr.strip() or result.stdout.strip()
+            if args[0] == "brightnessctl" and any(
+                term in error.lower() for term in ("permission denied", "operation not permitted", "access denied")
+            ):
+                self.show_brightness_permission_help()
+            else:
+                self.notify(error.splitlines()[-1][:58] if error else "Operation failed")
             return False
         self.notify(success_message)
         QTimer.singleShot(700, self.refresh_status)
@@ -675,6 +720,22 @@ class CozyOrbit(QWidget):
             return
         self.execute(["brightnessctl", "set", amount], f"Brightness {amount}")
 
+    def show_brightness_permission_help(self):
+        details = (
+            "Cozy Orbit can find the brightness controller, but your user account "
+            "does not have permission to change it.\n\n"
+            "On Kubuntu, first inspect the device permissions with:\n"
+            "  ls -l /sys/class/backlight/*/brightness\n\n"
+            "If the device is owned by the video group, you can add your account "
+            "to that group with:\n"
+            "  sudo usermod -aG video $USER\n\n"
+            "Then fully log out and log back in (or reboot). This only helps when "
+            "the backlight device grants write access to the video group. Some "
+            "hardware needs a device-specific udev rule instead.\n\n"
+            "Do not run Cozy Orbit as root."
+        )
+        QMessageBox.warning(self, "Brightness permission required", details)
+
     def show_battery(self):
         self.refresh_battery()
         detail = f"Battery: {self.battery}"
@@ -700,7 +761,17 @@ class CozyOrbit(QWidget):
             "rotation_speed_level", 2, type=int
         )
         self.rotation_speed = self.speed_from_level(self.rotation_speed_level)
+        if not self.frame_timer.isActive():
+            self.frame_timer.start()
         self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self.frame_timer.isActive():
+            self.frame_timer.start()
+        # Kick a first paint/status refresh after the compositor has mapped us.
+        QTimer.singleShot(0, self.update)
+        QTimer.singleShot(150, self.refresh_status)
 
     def open_kde_settings(self):
         if launch_application("systemsettings"):
