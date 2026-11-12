@@ -79,14 +79,8 @@ LABELS = [
 ]
 
 ICONS = [
-    "⌁",
-    "ᛒ",
-    "−",
-    "+",
-    "▰",
-    "☾",
-    "☼",
-    "⚙",
+    "W", "B", "-", "+",
+    "%", "-", "+", "S"
 ]
 
 
@@ -131,6 +125,8 @@ class CozyOrbit(QWidget):
 
     def __init__(self):
         super().__init__()
+
+        self.pressed_index = -1
 
         self.setWindowTitle(APP_NAME)
 
@@ -329,26 +325,35 @@ class CozyOrbit(QWidget):
 
     def execute(self, args, success_message):
 
-        result = run_command(args)
+    if not has_command(args[0]):
+        self.notify(f"Missing: {args[0]}")
+        return False
 
-        if result is None:
-            self.notify("Command unavailable")
-            return False
+    result = run_command(args)
 
-        if result.returncode != 0:
-            error = result.stderr.strip().splitlines()
+    if result is None:
+        self.notify("Command execution failed")
+        return False
 
-            self.notify(
-                error[-1][:45] if error
-                else "Operation failed"
-            )
+    if result.returncode != 0:
 
-            return False
+        error = result.stderr.strip()
 
-        self.notify(success_message)
-        QTimer.singleShot(500, self.refresh_status)
+        self.notify(
+            error.splitlines()[-1][:55]
+            if error else "Operation failed"
+        )
 
-        return True
+        return False
+
+    self.notify(success_message)
+
+    QTimer.singleShot(
+        700,
+        self.refresh_status
+    )
+
+    return True
 
     # --------------------------------------------------
     # ANIMATION
@@ -536,11 +541,7 @@ class CozyOrbit(QWidget):
             )
 
             painter.setFont(
-                QFont(
-                    "Noto Sans",
-                    14,
-                    QFont.Weight.DemiBold
-                )
+                QFont("DejaVu Sans", 13, QFont.Weight.Bold)
             )
 
             painter.drawText(
@@ -668,66 +669,139 @@ class CozyOrbit(QWidget):
     # MOUSE INTERACTION
     # --------------------------------------------------
 
-    def mouseMoveEvent(self, event):
+    
+def mouseMoveEvent(self, event):
 
-        pos = QPointF(event.position())
+    pos = QPointF(event.position())
 
-        if self.drag_origin is not None:
+    # Dragging the centre orb
+    if self.drag_origin is not None:
 
-            delta = (
-                event.globalPosition().toPoint()
-                - self.drag_origin
-            )
-
-            self.move(
-                self.window_origin + delta
-            )
-
-            return
-
-        center_distance = self.distance(
-            pos,
-            CENTER
+        delta = (
+            event.globalPosition().toPoint()
+            - self.drag_origin
         )
 
-        # Keep menu open while the pointer is
-        # moving between radial buttons.
-        inside_orb = (
-            center_distance < ORB_RADIUS + 12
+        self.move(self.window_origin + delta)
+        return
+
+    distance = self.distance(pos, CENTER)
+
+    # Keep the menu open while the cursor
+    # moves inside the radial control area.
+    inside_orb = distance < ORB_RADIUS + 12
+
+    inside_menu = (
+        self.expanded and distance < 190
+    )
+
+    self.set_expanded(
+        inside_orb or inside_menu
+    )
+
+    # Only detect button hovering after
+    # the animation has completed.
+    self.hover_index = -1
+
+    if self.progress > 0.95:
+
+        for i, point in enumerate(self.target_positions()):
+
+            if self.distance(pos, point) < ITEM_RADIUS + 12:
+                self.hover_index = i
+                break
+
+    if self.hover_index >= 0:
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+    else:
+        self.unsetCursor()
+
+    self.update()
+
+
+def leaveEvent(self, event):
+
+    self.hover_index = -1
+    self.pressed_index = -1
+    self.set_expanded(False)
+    self.unsetCursor()
+
+
+def mousePressEvent(self, event):
+
+    pos = QPointF(event.position())
+
+    if event.button() == Qt.MouseButton.RightButton:
+
+        self.context_menu(
+            event.globalPosition().toPoint()
         )
 
-        inside_panel = (
-            self.expanded
-            and center_distance < 194
+        return
+
+    if event.button() != Qt.MouseButton.LeftButton:
+        return
+
+    # Detect radial button clicks first.
+    if self.progress > 0.95:
+
+        for i, point in enumerate(self.target_positions()):
+
+            if self.distance(pos, point) < ITEM_RADIUS + 12:
+
+                self.pressed_index = i
+                return
+
+    # Centre orb: dragging or expanding.
+    if self.distance(pos, CENTER) < ORB_RADIUS + 12:
+
+        self.drag_origin = (
+            event.globalPosition().toPoint()
         )
 
-        self.set_expanded(
-            inside_orb or inside_panel
-        )
+        self.window_origin = self.pos()
 
-        self.hover_index = -1
 
-        if self.progress > 0.35:
+def mouseReleaseEvent(self, event):
 
-            for i, point in enumerate(
-                self.item_positions()
-            ):
+    if event.button() != Qt.MouseButton.LeftButton:
+        return
 
-                if self.distance(pos, point) < ITEM_RADIUS + 9:
-                    self.hover_index = i
-                    break
+    pos = QPointF(event.position())
 
-        if self.hover_index >= 0:
-            self.setCursor(
-                Qt.CursorShape.PointingHandCursor
-            )
+    # Handle radial button click.
+    if self.pressed_index >= 0:
+
+        index = self.pressed_index
+        self.pressed_index = -1
+
+        if self.progress > 0.95:
+
+            point = self.target_positions()[index]
+
+            if self.distance(pos, point) < ITEM_RADIUS + 12:
+                self.activate(index)
+
+        return
+
+    # Handle centre orb dragging.
+    if self.drag_origin is not None:
+
+        moved = (
+            event.globalPosition().toPoint()
+            - self.drag_origin
+        ).manhattanLength() > 5
+
+        self.drag_origin = None
+
+        if moved:
+            self.save_position()
 
         else:
-            self.setCursor(
-                Qt.CursorShape.OpenHandCursor
-            )
+            self.set_expanded(not self.expanded)
 
-        self.update()
+        return
+
 
     def leaveEvent(self, event):
 
@@ -1086,6 +1160,22 @@ class CozyOrbit(QWidget):
         self.save_position()
 
         event.accept()
+
+    def target_positions(self):
+
+    positions = []
+
+    for i in range(8):
+        angle = math.radians(-90 + i * 45)
+
+        positions.append(
+            QPointF(
+                CENTER.x() + math.cos(angle) * ORBIT_RADIUS,
+                CENTER.y() + math.sin(angle) * ORBIT_RADIUS
+            )
+        )
+
+    return positions
 
 
 # --------------------------------------------------
