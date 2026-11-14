@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.9.2
+Cozy Orbit v0.9.3
 A customisable radial desktop control widget for KDE Plasma 6 (Wayland/X11).
 
 Requirements:
@@ -59,7 +59,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Cozy Orbit"
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.3"
 ORG_NAME = "CozyOrbit"
 SETTINGS_DOMAIN = "cozy-orbit"
 
@@ -279,7 +279,10 @@ def set_autostart(enabled: bool) -> bool:
                 "Comment=Radial desktop control widget\n"
                 f'Exec="{sys.executable}" "{script}"\n'
                 "Terminal=false\n"
+                "StartupNotify=false\n"
+                "X-KDE-autostart-enabled=true\n"
                 "X-KDE-autostart-after=panel\n"
+                "X-GNOME-Autostart-enabled=true\n"
             )
         else:
             path.unlink(missing_ok=True)
@@ -585,7 +588,9 @@ class CozyOrbit(QWidget):
     # ----- window position -------------------------------------------------
 
     def restore_position(self):
-        # Wayland compositors decide window placement; only restore on X11.
+        # Wayland compositors decide window placement and do not let ordinary
+        # clients restore arbitrary global coordinates. Position persistence
+        # is therefore supported on X11; on Wayland, KWin controls placement.
         if is_wayland():
             return
         saved = self.settings.value("position")
@@ -1099,10 +1104,11 @@ class CozyOrbit(QWidget):
         self.bluetooth = data.get("bluetooth", self.bluetooth)
         self.volume_percent = data.get("volume", self.volume_percent)
         self.brightness_percent = data.get("brightness", self.brightness_percent)
-        if self.radial_control == "volume":
+        # Once a radial control is open, keep its displayed value under the
+        # pointer/user's control. A status poll may have started before the
+        # drag and otherwise snap the knob back to an older system value.
+        if self.radial_control is None:
             self.radial_value = self.volume_percent
-        elif self.radial_control == "brightness":
-            self.radial_value = self.brightness_percent
         self.update()
 
     def refresh_battery(self):
@@ -1185,10 +1191,14 @@ class CozyOrbit(QWidget):
     def set_radial_from_position(self, pos):
         dx, dy = pos.x() - CENTER.x(), pos.y() - CENTER.y()
         angle = math.degrees(math.atan2(dy, dx))
+
+        # The active track spans 270 degrees. The unused 90-degree sector
+        # clamps to the nearest endpoint instead of wrapping across the scale.
         progress = (135.0 - angle) % 360.0
         if progress > 270.0:
-            progress = 0.0 if progress > 315.0 else 100.0
-        self.radial_value = max(0, min(100, round(progress / 270.0 * 100)))
+            progress = 270.0 if progress < 315.0 else 0.0
+
+        self.radial_value = max(0, min(100, round(progress * 100.0 / 270.0)))
         self.radial_command_timer.start()
         self.update()
 
@@ -1290,6 +1300,8 @@ class CozyOrbit(QWidget):
         # Rebuild icons now that the real screen (and its DPI) is known.
         self.tinted_icons = self.make_tinted_icons()
         self.update_frame_timer()
+        # Re-assert stacking after the compositor maps the window.
+        QTimer.singleShot(0, self.raise_)
         # Kick a first paint/status refresh after the compositor has mapped us.
         QTimer.singleShot(0, self.update)
         QTimer.singleShot(150, self.refresh_status)
@@ -1384,8 +1396,13 @@ def main():
         print(f"{APP_NAME} is already running.", file=sys.stderr)
         return 0
 
+    # Register this script to launch automatically at desktop login.
+    if not autostart_enabled():
+        set_autostart(True)
+
     widget = CozyOrbit()
     widget.show()
+    widget.raise_()
     code = app.exec()
     lock.unlock()
     return code
