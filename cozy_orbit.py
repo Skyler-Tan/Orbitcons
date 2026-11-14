@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cozy Orbit v0.9.3
+Cozy Orbit v0.9.4
 A customisable radial desktop control widget for KDE Plasma 6 (Wayland/X11).
 
 Requirements:
@@ -59,7 +59,7 @@ from PySide6.QtWidgets import (
 )
 
 APP_NAME = "Cozy Orbit"
-APP_VERSION = "0.9.3"
+APP_VERSION = "0.9.4"
 ORG_NAME = "CozyOrbit"
 SETTINGS_DOMAIN = "cozy-orbit"
 
@@ -87,6 +87,18 @@ SYSTEM_ICON_CANDIDATES = [
     ("preferences-system", "settings-configure"),
 ]
 ICON_FALLBACKS = ["W", "B", "♪", "%", "☼", "⚙"]
+
+CENTER_ICONS = {
+    "Sakura": "❀",
+    "Snowflake": "❄",
+    "Daisy": "✿",
+    "Sparkle": "✦",
+    "Heart": "♥",
+    "Crescent Moon": "☾",
+    "Leaf": "❧",
+    "Butterfly": "❦",
+    "Classic Flower": "✾",
+}
 
 THEMES = {
     "Pastel Pink": {
@@ -329,6 +341,14 @@ class WidgetSettingsDialog(QDialog):
         # doesn't trigger a preview.
         self.theme_combo.currentTextChanged.connect(self.preview_theme)
         appearance_form.addRow("Colour theme", self.theme_combo)
+
+        self.center_icon_combo = QComboBox()
+        self.center_icon_combo.addItems(CENTER_ICONS.keys())
+        self.center_icon_combo.setCurrentText(
+            settings.value("center_icon", "Sakura", type=str)
+        )
+        self.center_icon_combo.currentTextChanged.connect(self.preview_center_icon)
+        appearance_form.addRow("Centre icon", self.center_icon_combo)
         root.addWidget(appearance)
 
         motion = QGroupBox("Animation")
@@ -395,6 +415,11 @@ class WidgetSettingsDialog(QDialog):
         if hasattr(parent, "preview_theme"):
             parent.preview_theme(name)
 
+    def preview_center_icon(self, name: str):
+        parent = self.parent()
+        if hasattr(parent, "preview_center_icon"):
+            parent.preview_center_icon(name)
+
     def reject(self):
         # Undo any live theme preview.
         parent = self.parent()
@@ -413,6 +438,7 @@ class WidgetSettingsDialog(QDialog):
     def save_preferences(self) -> bool:
         """Persist settings. Returns False if the autostart entry failed."""
         self.settings.setValue("theme", self.theme_combo.currentText())
+        self.settings.setValue("center_icon", self.center_icon_combo.currentText())
         self.settings.setValue("rotation_enabled", self.rotate_check.isChecked())
         self.settings.setValue("rotation_speed_level", self.speed_slider.value())
         self.settings.sync()
@@ -451,6 +477,10 @@ class CozyOrbit(QWidget):
         self.theme_name = self.settings.value("theme", "Pastel Pink", type=str)
         if self.theme_name not in THEMES:
             self.theme_name = "Pastel Pink"
+        self.center_icon_name = self.settings.value("center_icon", "Sakura", type=str)
+        if self.center_icon_name not in CENTER_ICONS:
+            self.center_icon_name = "Sakura"
+        self.setWindowIcon(self.make_center_icon())
         self.tinted_icons = self.make_tinted_icons()
         self.rotation_enabled = self.settings.value(
             "rotation_enabled", True, type=bool
@@ -564,16 +594,47 @@ class CozyOrbit(QWidget):
         # Not called "palette": that would shadow QWidget.palette().
         return THEMES[self.theme_name]
 
+    def make_center_icon(self) -> QIcon:
+        """Create the application icon from the selected centre emblem."""
+        pixmap = QPixmap(128, 128)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        colours = THEMES[self.theme_name]
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(colours["background_start"]))
+        painter.drawEllipse(QRectF(4, 4, 120, 120))
+        painter.setPen(QColor(colours["center_icon"]))
+        font = QFont("Noto Sans Symbols 2", 76)
+        if not font.exactMatch():
+            font = QFont("DejaVu Sans", 76)
+        painter.setFont(font)
+        painter.drawText(QRectF(4, 2, 120, 124), Qt.AlignmentFlag.AlignCenter,
+                         CENTER_ICONS[self.center_icon_name])
+        painter.end()
+        return QIcon(pixmap)
+
     def preview_theme(self, name: str):
         if name in THEMES:
             self.theme_name = name
             self.tinted_icons = self.make_tinted_icons()
+            self.setWindowIcon(self.make_center_icon())
+            self.update()
+
+    def preview_center_icon(self, name: str):
+        if name in CENTER_ICONS:
+            self.center_icon_name = name
+            self.setWindowIcon(self.make_center_icon())
             self.update()
 
     def apply_preferences(self):
         self.theme_name = self.settings.value("theme", "Pastel Pink", type=str)
         if self.theme_name not in THEMES:
             self.theme_name = "Pastel Pink"
+        self.center_icon_name = self.settings.value("center_icon", "Sakura", type=str)
+        if self.center_icon_name not in CENTER_ICONS:
+            self.center_icon_name = "Sakura"
+        self.setWindowIcon(self.make_center_icon())
         self.rotation_enabled = self.settings.value(
             "rotation_enabled", True, type=bool
         )
@@ -869,22 +930,23 @@ class CozyOrbit(QWidget):
         painter.setBrush(QBrush(gradient))
         painter.drawEllipse(CENTER, ORB_RADIUS, ORB_RADIUS)
 
-        # Six petals unfold from the centre whenever the orbit opens.
-        petal_colour = QColor(p["center_icon"])
-        painter.setPen(QPen(QColor(p["outline"]), 0.8))
-        painter.setBrush(petal_colour)
+        # The selected emblem sits in the centre and gently scales as the
+        # orbit opens. The same emblem is also used as the application icon.
         openness = self._flower_openness
-        for i in range(6):
-            painter.save()
-            painter.translate(CENTER)
-            painter.rotate(i * 60 - 90)
-            painter.translate(0, -8 - 8 * openness)
-            painter.scale(0.55 + 0.45 * openness, 0.55 + 0.45 * openness)
-            painter.drawEllipse(QRectF(-5.5, -10, 11, 17))
-            painter.restore()
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(p["accent"]))
-        painter.drawEllipse(CENTER, 5.5, 5.5)
+        painter.save()
+        painter.translate(CENTER)
+        scale = 0.82 + 0.18 * openness
+        painter.scale(scale, scale)
+        painter.setPen(QColor(p["center_icon"]))
+        emblem_font = QFont("Noto Sans Symbols 2", 42)
+        if not emblem_font.exactMatch():
+            emblem_font = QFont("DejaVu Sans", 42)
+        painter.setFont(emblem_font)
+        painter.drawText(QRectF(-ORB_RADIUS, -ORB_RADIUS, ORB_RADIUS * 2,
+                                ORB_RADIUS * 2),
+                         Qt.AlignmentFlag.AlignCenter,
+                         CENTER_ICONS[self.center_icon_name])
+        painter.restore()
         painter.restore()
 
     def draw_notification(self, painter):
